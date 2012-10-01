@@ -1,4 +1,4 @@
-haproxy (1.5.0-1raxdev12~lucid1) lucid; urgency=low
+haproxy (1.5.0-1raxdev12~precise) precise; urgency=low
 
   * Please check on the source CHANGELOG file for more information
   * This packages was built using the development 1.5-dev12 release
