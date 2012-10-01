@@ -1,0 +1,38 @@
+From b8ffd378f0dfe57e4b613db80600816e83d8e2fa Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 27 Sep 2012 15:08:56 +0200
+Subject: BUG/MAJOR: http: chunk parser was broken with buffer changes
+
+Since at least commit a458b679, msg->sov could become negative in
+http_parse_chunk_size() if a chunk size wrapped around the buffer.
+The effect is that at some point channel_forward() was called with
+a negative size, causing all data to be transferred without being
+analyzed anymore.
+
+Since haproxy does not support keep-alive with the server yet, this
+issue is not really noticeable, as the server closes the connection
+in response. Still, when tunnel mode is used or when pretent-keepalive
+is used, it is possible to see the problem.
+
+This issue was reported and diagnosed by William Lallemand at
+Exceliance.
+---
+ src/proto_http.c |    2 ++
+ 1 files changed, 2 insertions(+), 0 deletions(-)
+
+diff --git a/src/proto_http.c b/src/proto_http.c
+index 983d394..85ee021 100644
+--- a/src/proto_http.c
++++ b/src/proto_http.c
+@@ -1826,6 +1826,8 @@ int http_parse_chunk_size(struct http_msg *msg)
+ 	 * which may or may not be present. We save that into ->next and
+ 	 * ->sov.
+ 	 */
++	if (ptr < ptr_old)
++		msg->sov += buf->buf.size;
+ 	msg->sov += ptr - ptr_old;
+ 	msg->next = buffer_count(&buf->buf, buf->buf.p, ptr);
+ 	msg->chunk_len = chunk;
+-- 
+1.7.1
+

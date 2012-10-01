@@ -1,0 +1,100 @@
+From 51fb7651c40cc6427774ed0fea647abe4c5d1cd6 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Tue, 18 Sep 2012 18:24:39 +0200
+Subject: MINOR: listener: add a scope field in the bind keyword lists
+
+This scope is used to report what the keywords are used for (eg: TCP,
+UNIX, ...). It is now reported by bind_dump_kws().
+---
+ include/types/listener.h |    3 ++-
+ src/listener.c           |    8 +++++---
+ src/proto_tcp.c          |    2 +-
+ src/proto_uxst.c         |    2 +-
+ src/ssl_sock.c           |    2 +-
+ 5 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/include/types/listener.h b/include/types/listener.h
+index f21a28d..fda7cea 100644
+--- a/include/types/listener.h
++++ b/include/types/listener.h
+@@ -173,9 +173,10 @@ struct bind_kw {
+  * A keyword list. It is a NULL-terminated array of keywords. It embeds a
+  * struct list in order to be linked to other lists, allowing it to easily
+  * be declared where it is needed, and linked without duplicating data nor
+- * allocating memory.
++ * allocating memory. It is also possible to indicate a scope for the keywords.
+  */
+ struct bind_kw_list {
++	const char *scope;
+ 	struct list list;
+ 	struct bind_kw kw[VAR_ARRAY];
+ };
+diff --git a/src/listener.c b/src/listener.c
+index 2667fd4..09a0257 100644
+--- a/src/listener.c
++++ b/src/listener.c
+@@ -469,9 +469,11 @@ void bind_dump_kws(char **out)
+ 		for (index = 0; kwl->kw[index].kw != NULL; index++) {
+ 			if (kwl->kw[index].parse ||
+ 			    bind_find_kw(kwl->kw[index].kw) == &kwl->kw[index]) {
+-				memprintf(out, "%s%s %s\n", *out ? *out : "",
++				memprintf(out, "%s[%4s] %s%s%s\n", *out ? *out : "",
++				          kwl->scope,
+ 				          kwl->kw[index].kw,
+-				          kwl->kw[index].parse ? "" : "(not supported)");
++				          kwl->kw[index].skip ? " <arg>" : "",
++				          kwl->kw[index].parse ? "" : " (not supported)");
+ 			}
+ 		}
+ 	}
+@@ -662,7 +664,7 @@ static struct acl_kw_list acl_kws = {{ },{
+  * the config parser can report an appropriate error when a known keyword was
+  * not enabled.
+  */
+-static struct bind_kw_list bind_kws = {{ },{
++static struct bind_kw_list bind_kws = { "ALL", { }, {
+ 	{ "accept-proxy", bind_parse_accept_proxy, 0 }, /* enable PROXY protocol */
+ 	{ "backlog",      bind_parse_backlog,      1 }, /* set backlog of listening socket */
+ 	{ "id",           bind_parse_id,           1 }, /* set id of listening socket */
+diff --git a/src/proto_tcp.c b/src/proto_tcp.c
+index fe89569..6b1b15e 100644
+--- a/src/proto_tcp.c
++++ b/src/proto_tcp.c
+@@ -1842,7 +1842,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
+  * the config parser can report an appropriate error when a known keyword was
+  * not enabled.
+  */
+-static struct bind_kw_list bind_kws = {{ },{
++static struct bind_kw_list bind_kws = { "TCP", { }, {
+ #ifdef TCP_DEFER_ACCEPT
+ 	{ "defer-accept",  bind_parse_defer_accept, 0 }, /* wait for some data for 1 second max before doing accept */
+ #endif
+diff --git a/src/proto_uxst.c b/src/proto_uxst.c
+index 3ea468f..5f56ad5 100644
+--- a/src/proto_uxst.c
++++ b/src/proto_uxst.c
+@@ -493,7 +493,7 @@ static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct li
+  * the config parser can report an appropriate error when a known keyword was
+  * not enabled.
+  */
+-static struct bind_kw_list bind_kws = {{ },{
++static struct bind_kw_list bind_kws = { "UNIX", { }, {
+ 	{ "gid",   bind_parse_gid,   1 },      /* set the socket's gid */
+ 	{ "group", bind_parse_group, 1 },      /* set the socket's gid from the group name */
+ 	{ "mode",  bind_parse_mode,  1 },      /* set the socket's mode (eg: 0644)*/
+diff --git a/src/ssl_sock.c b/src/ssl_sock.c
+index 4d78f6d..2d5e666 100644
+--- a/src/ssl_sock.c
++++ b/src/ssl_sock.c
+@@ -903,7 +903,7 @@ static struct acl_kw_list acl_kws = {{ },{
+  * the config parser can report an appropriate error when a known keyword was
+  * not enabled.
+  */
+-static struct bind_kw_list bind_kws = {{ },{
++static struct bind_kw_list bind_kws = { "SSL", { }, {
+ 	{ "ciphers",               bind_parse_ciphers, 1 }, /* set SSL cipher suite */
+ 	{ "crt",                   bind_parse_crt,     1 }, /* load SSL certificates from this location */
+ 	{ "nosslv3",               bind_parse_nosslv3, 0 }, /* disable SSLv3 */
+-- 
+1.7.1
+

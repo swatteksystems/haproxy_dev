@@ -1,0 +1,640 @@
+From 2a65ff014ec63e3ea5fc1b491a6ce3dabab65fd8 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 13 Sep 2012 17:54:29 +0200
+Subject: MEDIUM: config: replace ssl_conf by bind_conf
+
+Some settings need to be merged per-bind config line and are not necessarily
+SSL-specific. It becomes quite inconvenient to have this ssl_conf SSL-specific,
+so let's replace it with something more generic.
+---
+ include/proto/listener.h |   16 ++++----
+ include/proto/ssl_sock.h |   10 ++--
+ include/types/listener.h |    8 ++--
+ include/types/proxy.h    |    2 +-
+ src/cfgparse.c           |   94 ++++++++++++++-------------------------------
+ src/haproxy.c            |   27 ++++++-------
+ src/proxy.c              |    2 +-
+ src/ssl_sock.c           |   74 ++++++++++++++++++------------------
+ 8 files changed, 97 insertions(+), 136 deletions(-)
+
+diff --git a/include/proto/listener.h b/include/proto/listener.h
+index 415b913..4019ff1 100644
+--- a/include/proto/listener.h
++++ b/include/proto/listener.h
+@@ -105,21 +105,21 @@ void delete_listener(struct listener *listener);
+  */
+ int listener_accept(int fd);
+ 
+-/* allocate an ssl_conf struct for a bind line, and chain it to list head <lh>.
++/* allocate an bind_conf struct for a bind line, and chain it to list head <lh>.
+  * If <arg> is not NULL, it is duplicated into ->arg to store useful config
+  * information for error reporting.
+  */
+-static inline struct ssl_conf *ssl_conf_alloc(struct list *lh, const char *file, int line, const char *arg)
++static inline struct bind_conf *bind_conf_alloc(struct list *lh, const char *file, int line, const char *arg)
+ {
+-	struct ssl_conf *ssl_conf = (void *)calloc(1, sizeof(struct ssl_conf));
++	struct bind_conf *bind_conf = (void *)calloc(1, sizeof(struct bind_conf));
+ 
+-	ssl_conf->file = strdup(file);
+-	ssl_conf->line = line;
++	bind_conf->file = strdup(file);
++	bind_conf->line = line;
+ 	if (lh)
+-		LIST_ADDQ(lh, &ssl_conf->by_fe);
++		LIST_ADDQ(lh, &bind_conf->by_fe);
+ 	if (arg)
+-		ssl_conf->arg = strdup(arg);
+-	return ssl_conf;
++		bind_conf->arg = strdup(arg);
++	return bind_conf;
+ }
+ 
+ #endif /* _PROTO_LISTENER_H */
+diff --git a/include/proto/ssl_sock.h b/include/proto/ssl_sock.h
+index 6192fe8..4bff954 100644
+--- a/include/proto/ssl_sock.h
++++ b/include/proto/ssl_sock.h
+@@ -30,11 +30,11 @@
+ 
+ extern struct data_ops ssl_sock;
+ int ssl_sock_handshake(struct connection *conn, unsigned int flag);
+-int ssl_sock_load_cert(char *path, struct ssl_conf *ssl_conf, struct proxy *proxy);
+-int ssl_sock_prepare_ctx(struct ssl_conf *ssl_conf, SSL_CTX *ctx, struct proxy *proxy);
+-void ssl_sock_free_certs(struct ssl_conf *ssl_conf);
+-int ssl_sock_prepare_all_ctx(struct ssl_conf *ssl_conf, struct proxy *px);
+-void ssl_sock_free_all_ctx(struct ssl_conf *ssl_conf);
++int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, struct proxy *proxy);
++int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy *proxy);
++void ssl_sock_free_certs(struct bind_conf *bind_conf);
++int ssl_sock_prepare_all_ctx(struct bind_conf *bind_conf, struct proxy *px);
++void ssl_sock_free_all_ctx(struct bind_conf *bind_conf);
+ 
+ #endif /* _PROTO_SSL_SOCK_H */
+ 
+diff --git a/include/types/listener.h b/include/types/listener.h
+index 78195ec..0985329 100644
+--- a/include/types/listener.h
++++ b/include/types/listener.h
+@@ -93,8 +93,8 @@ enum {
+  * maxconn setting to the global.maxsock value so that its resources are reserved.
+  */
+ 
+-/* "bind" line SSL settings */
+-struct ssl_conf {
++/* "bind" line settings */
++struct bind_conf {
+ #ifdef USE_OPENSSL
+ 	char *ciphers;             /* cipher suite to use if non-null */
+ 	int nosslv3;               /* disable SSLv3 */
+@@ -104,7 +104,7 @@ struct ssl_conf {
+ 	struct eb_root sni_ctx;    /* sni_ctx tree of all known certs full-names sorted by name */
+ 	struct eb_root sni_w_ctx;  /* sni_ctx tree of all known certs wildcards sorted by name */
+ #endif
+-	int ref_cnt;               /* number of users of this config, maybe 0 on error */
++	int is_ssl;                /* SSL is required for these listeners */
+ 	struct list by_fe;         /* next binding for the same frontend, or NULL */
+ 	char *arg;                 /* argument passed to "bind" for better error reporting */
+ 	char *file;                /* file where the section appears */
+@@ -147,7 +147,7 @@ struct listener {
+ 	char *interface;		/* interface name or NULL */
+ 	int maxseg;			/* for TCP, advertised MSS */
+ 
+-	struct ssl_conf *ssl_conf;	/* SSL settings, otherwise NULL */
++	struct bind_conf *bind_conf;	/* "bind" line settings, include SSL settings among other things */
+ 
+ 	/* warning: this struct is huge, keep it at the bottom */
+ 	struct sockaddr_storage addr;	/* the address we listen to */
+diff --git a/include/types/proxy.h b/include/types/proxy.h
+index a2355d5..dde002a 100644
+--- a/include/types/proxy.h
++++ b/include/types/proxy.h
+@@ -360,7 +360,7 @@ struct proxy {
+ 		struct eb32_node id;		/* place in the tree of used IDs */
+ 		struct eb_root used_listener_id;/* list of listener IDs in use */
+ 		struct eb_root used_server_id;	/* list of server IDs in use */
+-		struct list ssl_bind;		/* list of SSL bind settings */
++		struct list bind;		/* list of bind settings */
+ 	} conf;					/* config information */
+ 	void *parent;				/* parent of the proxy when applicable */
+ };
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index f78f896..8a7b29a 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1380,7 +1380,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 	struct acl_cond *cond = NULL;
+ 	struct logsrv *tmplogsrv;
+ 	char *errmsg = NULL;
+-	struct ssl_conf *ssl_conf;
++	struct bind_conf *bind_conf;
+ 
+ 	if (!strcmp(args[0], "listen"))
+ 		rc = PR_CAP_LISTEN;
+@@ -1689,7 +1689,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 		}
+ 
+ 		last_listen = curproxy->listen;
+-		ssl_conf = NULL;
++		bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[1]);
+ 
+ 		/* NOTE: the following line might create several listeners if there
+ 		 * are comma-separated IPs or port ranges. So all further processing
+@@ -1704,6 +1704,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 		while (new_listen != last_listen) {
+ 			new_listen->conf.file = file;
+ 			new_listen->conf.line = linenum;
++			new_listen->bind_conf = bind_conf;
+ 			new_listen = new_listen->next;
+ 			global.maxsock++;
+ 		}
+@@ -1907,18 +1908,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 			if (!strcmp(args[cur_arg], "ssl")) { /* use ssl */
+ #ifdef USE_OPENSSL
+-				struct listener *l;
+-
+-				if (!ssl_conf)
+-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
+-
+-				for (l = curproxy->listen; l != last_listen; l = l->next) {
+-					if (!l->ssl_conf) {
+-						l->ssl_conf = ssl_conf;
+-						ssl_conf->ref_cnt++;
+-					}
+-				}
+-
++				bind_conf->is_ssl = 1;
+ 				cur_arg += 1;
+ 				continue;
+ #else
+@@ -1938,10 +1928,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 					goto out;
+ 				}
+ 
+-				if (!ssl_conf)
+-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
+-
+-				if (ssl_sock_load_cert(args[cur_arg + 1], ssl_conf, curproxy) > 0) {
++				if (ssl_sock_load_cert(args[cur_arg + 1], bind_conf, curproxy) > 0) {
+ 					err_code |= ERR_ALERT | ERR_FATAL;
+ 					goto out;
+ 				}
+@@ -1965,10 +1952,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 					goto out;
+ 				}
+ 
+-				if (!ssl_conf)
+-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
+-				ssl_conf->ciphers = strdup(args[cur_arg + 1]);
+-
++				bind_conf->ciphers = strdup(args[cur_arg + 1]);
+ 				cur_arg += 2;
+ 				continue;
+ #else
+@@ -1981,10 +1965,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 			if (!strcmp(args[cur_arg], "nosslv3")) { /* disable SSLv3 */
+ #ifdef USE_OPENSSL
+-				if (!ssl_conf)
+-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
+-				ssl_conf->nosslv3 = 1;
+-
++				bind_conf->nosslv3 = 1;
+ 				cur_arg += 1;
+ 				continue;
+ #else
+@@ -1997,10 +1978,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 			if (!strcmp(args[cur_arg], "notlsv1")) { /* disable TLSv1 */
+ #ifdef USE_OPENSSL
+-				if (!ssl_conf)
+-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
+-				ssl_conf->notlsv1 = 1;
+-
++				bind_conf->notlsv1 = 1;
+ 				cur_arg += 1;
+ 				continue;
+ #else
+@@ -2013,10 +1991,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 			if (!strcmp(args[cur_arg], "prefer-server-ciphers")) { /* Prefert server ciphers */
+ #if defined (USE_OPENSSL) && defined(SSL_OP_CIPHER_SERVER_PREFERENCE)
+-				if (!ssl_conf)
+-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
+-				ssl_conf->prefer_server_ciphers = 1;
+-
++				bind_conf->prefer_server_ciphers = 1;
+ 				cur_arg += 1;
+ 				continue;
+ #else
+@@ -6024,9 +5999,9 @@ int check_config_validity()
+ 	struct userlist *curuserlist = NULL;
+ 	int err_code = 0;
+ 	unsigned int next_pxid = 1;
+-	struct ssl_conf *ssl_conf, *ssl_back;
++	struct bind_conf *bind_conf;
+ 
+-	ssl_back = ssl_conf = NULL;
++	bind_conf = NULL;
+ 	/*
+ 	 * Now, check for the integrity of all that we have collected.
+ 	 */
+@@ -6922,15 +6897,17 @@ out_uri_auth_compat:
+ 			curproxy->listen = next;
+ 		}
+ 
+-#ifdef USE_OPENSSL
+ 		/* Configure SSL for each bind line.
+ 		 * Note: if configuration fails at some point, the ->ctx member
+ 		 * remains NULL so that listeners can later detach.
+ 		 */
+-		list_for_each_entry(ssl_conf, &curproxy->conf.ssl_bind, by_fe) {
+-			if (!ssl_conf->default_ctx) {
++		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
++			if (!bind_conf->is_ssl)
++				continue;
++#ifdef USE_OPENSSL
++			if (!bind_conf->default_ctx) {
+ 				Alert("Proxy '%s': no SSL certificate specified for bind '%s' at [%s:%d] (use 'crt').\n",
+-				      curproxy->id, ssl_conf->arg, ssl_conf->file, ssl_conf->line);
++				      curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+ 				cfgerr++;
+ 				continue;
+ 			}
+@@ -6942,9 +6919,9 @@ out_uri_auth_compat:
+ 			}
+ 
+ 			/* initialize all certificate contexts */
+-			cfgerr += ssl_sock_prepare_all_ctx(ssl_conf, curproxy);
+-		}
++			cfgerr += ssl_sock_prepare_all_ctx(bind_conf, curproxy);
+ #endif /* USE_OPENSSL */
++		}
+ 
+ 		/* adjust this proxy's listeners */
+ 		next_id = 1;
+@@ -6969,15 +6946,8 @@ out_uri_auth_compat:
+ 				}
+ 			}
+ #ifdef USE_OPENSSL
+-			if (listener->ssl_conf) {
+-				if (listener->ssl_conf->default_ctx) {
+-					listener->data = &ssl_sock; /* SSL data layer */
+-				}
+-				else {
+-					listener->ssl_conf->ref_cnt--;
+-					listener->ssl_conf = NULL;
+-				}
+-			}
++			if (listener->bind_conf->is_ssl && listener->bind_conf->default_ctx)
++				listener->data = &ssl_sock; /* SSL data layer */
+ #endif
+ 			if (curproxy->options & PR_O_TCP_NOLING)
+ 				listener->options |= LI_O_NOLINGER;
+@@ -6999,7 +6969,7 @@ out_uri_auth_compat:
+ 
+ 			/* smart accept mode is automatic in HTTP mode */
+ 			if ((curproxy->options2 & PR_O2_SMARTACC) ||
+-			    ((curproxy->mode == PR_MODE_HTTP || listener->ssl_conf) &&
++			    ((curproxy->mode == PR_MODE_HTTP || listener->bind_conf->is_ssl) &&
+ 			     !(curproxy->no_options2 & PR_O2_SMARTACC)))
+ 				listener->options |= LI_O_NOQUICKACK;
+ 
+@@ -7007,21 +6977,15 @@ out_uri_auth_compat:
+ 			listener = listener->next;
+ 		}
+ 
+-#ifdef USE_OPENSSL
+-		/* Release unused SSL configs.
+-		 */
+-		list_for_each_entry_safe(ssl_conf, ssl_back, &curproxy->conf.ssl_bind, by_fe) {
+-			if (ssl_conf->ref_cnt)
++		/* Release unused SSL configs */
++		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
++			if (bind_conf->is_ssl)
+ 				continue;
+-
+-			ssl_sock_free_all_ctx(ssl_conf);
+-			free(ssl_conf->ciphers);
+-			free(ssl_conf->file);
+-			free(ssl_conf->arg);
+-			LIST_DEL(&ssl_conf->by_fe);
+-			free(ssl_conf);
+-		}
++#ifdef USE_OPENSSL
++			ssl_sock_free_all_ctx(bind_conf);
++			free(bind_conf->ciphers);
+ #endif /* USE_OPENSSL */
++		}
+ 
+ 		/* Check multi-process mode compatibility for the current proxy */
+ 		if (global.nbproc > 1) {
+diff --git a/src/haproxy.c b/src/haproxy.c
+index 5edde4f..05df3da 100644
+--- a/src/haproxy.c
++++ b/src/haproxy.c
+@@ -856,7 +856,7 @@ void deinit(void)
+ 	struct uri_auth *uap, *ua = NULL;
+ 	struct logsrv *log, *logb;
+ 	struct logformat_node *lf, *lfb;
+-	struct ssl_conf *ssl_conf, *ssl_back;
++	struct bind_conf *bind_conf, *bind_back;
+ 	int i;
+ 
+ 	deinit_signals();
+@@ -1037,29 +1037,26 @@ void deinit(void)
+ 			l_next = l->next;
+ 			unbind_listener(l);
+ 			delete_listener(l);
+-			if (l->ssl_conf) {
+-				l->ssl_conf->ref_cnt--;
+-				l->ssl_conf = NULL;
+-			}
++			l->bind_conf = NULL;
+ 			free(l->name);
+ 			free(l->counters);
+ 			free(l);
+ 			l = l_next;
+ 		}/* end while(l) */
+ 
+-		ssl_back = ssl_conf = NULL;
+-#ifdef USE_OPENSSL
++		bind_back = bind_conf = NULL;
+ 		/* Release unused SSL configs.
+ 		 */
+-		list_for_each_entry_safe(ssl_conf, ssl_back, &p->conf.ssl_bind, by_fe) {
+-			ssl_sock_free_all_ctx(ssl_conf);
+-			free(ssl_conf->ciphers);
+-			free(ssl_conf->file);
+-			free(ssl_conf->arg);
+-			LIST_DEL(&ssl_conf->by_fe);
+-			free(ssl_conf);
+-		}
++		list_for_each_entry_safe(bind_conf, bind_back, &p->conf.bind, by_fe) {
++#ifdef USE_OPENSSL
++			ssl_sock_free_all_ctx(bind_conf);
++			free(bind_conf->ciphers);
+ #endif /* USE_OPENSSL */
++			free(bind_conf->file);
++			free(bind_conf->arg);
++			LIST_DEL(&bind_conf->by_fe);
++			free(bind_conf);
++		}
+ 
+ 		free(p->desc);
+ 		free(p->fwdfor_hdr_name);
+diff --git a/src/proxy.c b/src/proxy.c
+index 56d343e..307af93 100644
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -443,7 +443,7 @@ void init_new_proxy(struct proxy *p)
+ 	LIST_INIT(&p->logsrvs);
+ 	LIST_INIT(&p->logformat);
+ 	LIST_INIT(&p->format_unique_id);
+-	LIST_INIT(&p->conf.ssl_bind);
++	LIST_INIT(&p->conf.bind);
+ 
+ 	/* Timeouts are defined as -1 */
+ 	proxy_reset_timeouts(p);
+diff --git a/src/ssl_sock.c b/src/ssl_sock.c
+index 5f259f3..eb3c3a0 100644
+--- a/src/ssl_sock.c
++++ b/src/ssl_sock.c
+@@ -87,7 +87,7 @@ void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
+  * warning when no match is found, which implies the default (first) cert
+  * will keep being used.
+  */
+-static int ssl_sock_switchctx_cbk(SSL *ssl, int *al, struct ssl_conf *s)
++static int ssl_sock_switchctx_cbk(SSL *ssl, int *al, struct bind_conf *s)
+ {
+ 	const char *servername;
+ 	const char *wildp = NULL;
+@@ -129,7 +129,7 @@ static int ssl_sock_switchctx_cbk(SSL *ssl, int *al, struct ssl_conf *s)
+ /* Loads a certificate key and CA chain from a file. Returns 0 on error, -1 if
+  * an early error happens and the caller must call SSL_CTX_free() by itelf.
+  */
+-int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct ssl_conf *s)
++int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct bind_conf *s)
+ {
+ 	BIO *in;
+ 	X509 *x = NULL, *ca;
+@@ -255,7 +255,7 @@ end:
+ 	return ret;
+ }
+ 
+-int ssl_sock_load_cert_file(const char *path, struct ssl_conf *ssl_conf, struct proxy *curproxy)
++int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf, struct proxy *curproxy)
+ {
+ 	int ret;
+ 	SSL_CTX *ctx;
+@@ -263,21 +263,21 @@ int ssl_sock_load_cert_file(const char *path, struct ssl_conf *ssl_conf, struct
+ 	ctx = SSL_CTX_new(SSLv23_server_method());
+ 	if (!ctx) {
+ 		Alert("Proxy '%s': unable to allocate SSL context for bind '%s' at [%s:%d] using cert '%s'.\n",
+-		      curproxy->id, ssl_conf->arg, ssl_conf->file, ssl_conf->line, path);
++		      curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line, path);
+ 		return 1;
+ 	}
+ 
+ 	if (SSL_CTX_use_PrivateKey_file(ctx, path, SSL_FILETYPE_PEM) <= 0) {
+ 		Alert("Proxy '%s': unable to load SSL private key from file '%s' in bind '%s' at [%s:%d].\n",
+-			      curproxy->id, path, ssl_conf->arg, ssl_conf->file, ssl_conf->line);
++			      curproxy->id, path, bind_conf->arg, bind_conf->file, bind_conf->line);
+ 		SSL_CTX_free(ctx);
+ 		return 1;
+ 	}
+ 
+-	ret = ssl_sock_load_cert_chain_file(ctx, path, ssl_conf);
++	ret = ssl_sock_load_cert_chain_file(ctx, path, bind_conf);
+ 	if (ret <= 0) {
+ 		Alert("Proxy '%s': unable to load SSL certificate from file '%s' in bind '%s' at [%s:%d].\n",
+-		      curproxy->id, path, ssl_conf->arg, ssl_conf->file, ssl_conf->line);
++		      curproxy->id, path, bind_conf->arg, bind_conf->file, bind_conf->line);
+ 		if (ret < 0) /* serious error, must do that ourselves */
+ 			SSL_CTX_free(ctx);
+ 		return 1;
+@@ -286,19 +286,19 @@ int ssl_sock_load_cert_file(const char *path, struct ssl_conf *ssl_conf, struct
+ 	 * the tree, so it will be discovered and cleaned in time.
+ 	 */
+ #ifndef SSL_CTRL_SET_TLSEXT_HOSTNAME
+-	if (ssl_conf->default_ctx) {
++	if (bind_conf->default_ctx) {
+ 		Alert("Proxy '%s': file '%s' : this version of openssl cannot load multiple SSL certificates in bind '%s' at [%s:%d].\n",
+-		      curproxy->id, path, ssl_conf->arg, ssl_conf->file, ssl_conf->line);
++		      curproxy->id, path, bind_conf->arg, bind_conf->file, bind_conf->line);
+ 		return 1;
+ 	}
+ #endif
+-	if (!ssl_conf->default_ctx)
+-		ssl_conf->default_ctx = ctx;
++	if (!bind_conf->default_ctx)
++		bind_conf->default_ctx = ctx;
+ 
+ 	return 0;
+ }
+ 
+-int ssl_sock_load_cert(char *path, struct ssl_conf *ssl_conf, struct proxy *curproxy)
++int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, struct proxy *curproxy)
+ {
+ 	struct dirent *de;
+ 	DIR *dir;
+@@ -308,7 +308,7 @@ int ssl_sock_load_cert(char *path, struct ssl_conf *ssl_conf, struct proxy *curp
+ 	int cfgerr = 0;
+ 
+ 	if (!(dir = opendir(path)))
+-		return ssl_sock_load_cert_file(path, ssl_conf, curproxy);
++		return ssl_sock_load_cert_file(path, bind_conf, curproxy);
+ 
+ 	/* strip trailing slashes, including first one */
+ 	for (end = path + strlen(path) - 1; end >= path && *end == '/'; end--)
+@@ -322,13 +322,13 @@ int ssl_sock_load_cert(char *path, struct ssl_conf *ssl_conf, struct proxy *curp
+ 		snprintf(fp, pathlen + 1 + NAME_MAX + 1, "%s/%s", path, de->d_name);
+ 		if (stat(fp, &buf) != 0) {
+ 			Alert("Proxy '%s': unable to stat SSL certificate from file '%s' in bind '%s' at [%s:%d] : %s.\n",
+-			      curproxy->id, fp, ssl_conf->arg, ssl_conf->file, ssl_conf->line, strerror(errno));
++			      curproxy->id, fp, bind_conf->arg, bind_conf->file, bind_conf->line, strerror(errno));
+ 			cfgerr++;
+ 			continue;
+ 		}
+ 		if (!S_ISREG(buf.st_mode))
+ 			continue;
+-		cfgerr += ssl_sock_load_cert_file(fp, ssl_conf, curproxy);
++		cfgerr += ssl_sock_load_cert_file(fp, bind_conf, curproxy);
+ 	}
+ 	free(fp);
+ 	closedir(dir);
+@@ -348,7 +348,7 @@ int ssl_sock_load_cert(char *path, struct ssl_conf *ssl_conf, struct proxy *curp
+ #ifndef SSL_MODE_RELEASE_BUFFERS                        /* needs OpenSSL >= 1.0.0 */
+ #define SSL_MODE_RELEASE_BUFFERS 0
+ #endif
+-int ssl_sock_prepare_ctx(struct ssl_conf *ssl_conf, SSL_CTX *ctx, struct proxy *curproxy)
++int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy *curproxy)
+ {
+ 	int cfgerr = 0;
+ 	int ssloptions =
+@@ -361,11 +361,11 @@ int ssl_sock_prepare_ctx(struct ssl_conf *ssl_conf, SSL_CTX *ctx, struct proxy *
+ 		SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+ 		SSL_MODE_RELEASE_BUFFERS;
+ 
+-	if (ssl_conf->nosslv3)
++	if (bind_conf->nosslv3)
+ 		ssloptions |= SSL_OP_NO_SSLv3;
+-	if (ssl_conf->notlsv1)
++	if (bind_conf->notlsv1)
+ 		ssloptions |= SSL_OP_NO_TLSv1;
+-	if (ssl_conf->prefer_server_ciphers)
++	if (bind_conf->prefer_server_ciphers)
+ 		ssloptions |= SSL_OP_CIPHER_SERVER_PREFERENCE;
+ 
+ 	SSL_CTX_set_options(ctx, ssloptions);
+@@ -373,64 +373,64 @@ int ssl_sock_prepare_ctx(struct ssl_conf *ssl_conf, SSL_CTX *ctx, struct proxy *
+ 	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+ 
+ 	shared_context_set_cache(ctx);
+-	if (ssl_conf->ciphers &&
+-	    !SSL_CTX_set_cipher_list(ctx, ssl_conf->ciphers)) {
++	if (bind_conf->ciphers &&
++	    !SSL_CTX_set_cipher_list(ctx, bind_conf->ciphers)) {
+ 		Alert("Proxy '%s': unable to set SSL cipher list to '%s' for bind '%s' at [%s:%d].\n",
+-		curproxy->id, ssl_conf->ciphers, ssl_conf->arg, ssl_conf->file, ssl_conf->line);
++		curproxy->id, bind_conf->ciphers, bind_conf->arg, bind_conf->file, bind_conf->line);
+ 		cfgerr++;
+ 	}
+ 
+ 	SSL_CTX_set_info_callback(ctx, ssl_sock_infocbk);
+ #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
+ 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_cbk);
+-	SSL_CTX_set_tlsext_servername_arg(ctx, ssl_conf);
++	SSL_CTX_set_tlsext_servername_arg(ctx, bind_conf);
+ #endif
+ 	return cfgerr;
+ }
+ 
+-/* Walks down the two trees in ssl_conf and prepares all certs. The pointer may
++/* Walks down the two trees in bind_conf and prepares all certs. The pointer may
+  * be NULL, in which case nothing is done. Returns the number of errors
+  * encountered.
+  */
+-int ssl_sock_prepare_all_ctx(struct ssl_conf *ssl_conf, struct proxy *px)
++int ssl_sock_prepare_all_ctx(struct bind_conf *bind_conf, struct proxy *px)
+ {
+ 	struct ebmb_node *node;
+ 	struct sni_ctx *sni;
+ 	int err = 0;
+ 
+-	if (!ssl_conf)
++	if (!bind_conf || !bind_conf->is_ssl)
+ 		return 0;
+ 
+-	node = ebmb_first(&ssl_conf->sni_ctx);
++	node = ebmb_first(&bind_conf->sni_ctx);
+ 	while (node) {
+ 		sni = ebmb_entry(node, struct sni_ctx, name);
+ 		if (!sni->order) /* only initialize the CTX on its first occurrence */
+-			err += ssl_sock_prepare_ctx(ssl_conf, sni->ctx, px);
++			err += ssl_sock_prepare_ctx(bind_conf, sni->ctx, px);
+ 		node = ebmb_next(node);
+ 	}
+ 
+-	node = ebmb_first(&ssl_conf->sni_w_ctx);
++	node = ebmb_first(&bind_conf->sni_w_ctx);
+ 	while (node) {
+ 		sni = ebmb_entry(node, struct sni_ctx, name);
+ 		if (!sni->order) /* only initialize the CTX on its first occurrence */
+-			err += ssl_sock_prepare_ctx(ssl_conf, sni->ctx, px);
++			err += ssl_sock_prepare_ctx(bind_conf, sni->ctx, px);
+ 		node = ebmb_next(node);
+ 	}
+ 	return err;
+ }
+ 
+-/* Walks down the two trees in ssl_conf and frees all the certs. The pointer may
++/* Walks down the two trees in bind_conf and frees all the certs. The pointer may
+  * be NULL, in which case nothing is done. The default_ctx is nullified too.
+  */
+-void ssl_sock_free_all_ctx(struct ssl_conf *ssl_conf)
++void ssl_sock_free_all_ctx(struct bind_conf *bind_conf)
+ {
+ 	struct ebmb_node *node, *back;
+ 	struct sni_ctx *sni;
+ 
+-	if (!ssl_conf)
++	if (!bind_conf || !bind_conf->is_ssl)
+ 		return;
+ 
+-	node = ebmb_first(&ssl_conf->sni_ctx);
++	node = ebmb_first(&bind_conf->sni_ctx);
+ 	while (node) {
+ 		sni = ebmb_entry(node, struct sni_ctx, name);
+ 		back = ebmb_next(node);
+@@ -441,7 +441,7 @@ void ssl_sock_free_all_ctx(struct ssl_conf *ssl_conf)
+ 		node = back;
+ 	}
+ 
+-	node = ebmb_first(&ssl_conf->sni_w_ctx);
++	node = ebmb_first(&bind_conf->sni_w_ctx);
+ 	while (node) {
+ 		sni = ebmb_entry(node, struct sni_ctx, name);
+ 		back = ebmb_next(node);
+@@ -452,7 +452,7 @@ void ssl_sock_free_all_ctx(struct ssl_conf *ssl_conf)
+ 		node = back;
+ 	}
+ 
+-	ssl_conf->default_ctx = NULL;
++	bind_conf->default_ctx = NULL;
+ }
+ 
+ /*
+@@ -493,7 +493,7 @@ static int ssl_sock_init(struct connection *conn)
+ 	}
+ 	else if (target_client(&conn->target)) {
+ 		/* Alloc a new SSL session ctx */
+-		conn->data_ctx = SSL_new(target_client(&conn->target)->ssl_conf->default_ctx);
++		conn->data_ctx = SSL_new(target_client(&conn->target)->bind_conf->default_ctx);
+ 		if (!conn->data_ctx)
+ 			return -1;
+ 
+-- 
+1.7.1
+

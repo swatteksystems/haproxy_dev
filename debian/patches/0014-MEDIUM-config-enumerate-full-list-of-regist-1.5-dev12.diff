@@ -1,0 +1,100 @@
+From 8638f4850fcc4390c0e4d7102eda232c0b9b1d92 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Tue, 18 Sep 2012 18:01:17 +0200
+Subject: MEDIUM: config: enumerate full list of registered "bind" keywords upon error
+
+When an unknown "bind" keyword is detected, dump the list of all
+registered keywords. Unsupported default alternatives are also reported
+as "not supported".
+---
+ include/proto/listener.h |    3 +++
+ src/cfgparse.c           |   17 +++++++++++++++--
+ src/listener.c           |   22 ++++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/include/proto/listener.h b/include/proto/listener.h
+index e570a9b..bd57189 100644
+--- a/include/proto/listener.h
++++ b/include/proto/listener.h
+@@ -114,6 +114,9 @@ void bind_register_keywords(struct bind_kw_list *kwl);
+ /* Return a pointer to the bind keyword <kw>, or NULL if not found. */
+ struct bind_kw *bind_find_kw(const char *kw);
+ 
++/* Dumps all registered "bind" keywords to the <out> string pointer. */
++void bind_dump_kws(char **out);
++
+ /* allocate an bind_conf struct for a bind line, and chain it to list head <lh>.
+  * If <arg> is not NULL, it is duplicated into ->arg to store useful config
+  * information for error reporting.
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 08780ff..6a12d40 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1709,7 +1709,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 		}
+ 		cur_arg = 2;
+ 		while (*(args[cur_arg])) {
++			static int bind_dumped;
+ 			struct bind_kw *kw;
++			char *err;
++
+ 			kw = bind_find_kw(args[cur_arg]);
+ 			if (kw) {
+ 				char *err = NULL;
+@@ -1745,8 +1748,18 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 				continue;
+ 			}
+ 
+-			Alert("parsing [%s:%d] : '%s %s' only supports the 'transparent', 'accept-proxy', 'defer-accept', 'name', 'id', 'mss', 'mode', 'uid', 'gid', 'user', 'group' and 'interface' options.\n",
+-			      file, linenum, args[0], args[1]);
++			err = NULL;
++			if (!bind_dumped) {
++				bind_dump_kws(&err);
++				indent_msg(&err, 4);
++				bind_dumped = 1;
++			}
++
++			Alert("parsing [%s:%d] : '%s %s' unknown keyword '%s'.%s%s\n",
++			      file, linenum, args[0], args[1], args[cur_arg],
++			      err ? " Registered keywords :" : "", err ? err : "");
++			free(err);
++
+ 			err_code |= ERR_ALERT | ERR_FATAL;
+ 			goto out;
+ 		}
+diff --git a/src/listener.c b/src/listener.c
+index 91c0308..2667fd4 100644
+--- a/src/listener.c
++++ b/src/listener.c
+@@ -455,6 +455,28 @@ struct bind_kw *bind_find_kw(const char *kw)
+ 	return ret;
+ }
+ 
++/* Dumps all registered "bind" keywords to the <out> string pointer. The
++ * unsupported keywords are only dumped if their supported form was not
++ * found.
++ */
++void bind_dump_kws(char **out)
++{
++	struct bind_kw_list *kwl;
++	int index;
++
++	*out = NULL;
++	list_for_each_entry(kwl, &bind_keywords.list, list) {
++		for (index = 0; kwl->kw[index].kw != NULL; index++) {
++			if (kwl->kw[index].parse ||
++			    bind_find_kw(kwl->kw[index].kw) == &kwl->kw[index]) {
++				memprintf(out, "%s%s %s\n", *out ? *out : "",
++				          kwl->kw[index].kw,
++				          kwl->kw[index].parse ? "" : "(not supported)");
++			}
++		}
++	}
++}
++
+ /************************************************************************/
+ /*           All supported ACL keywords must be declared here.          */
+ /************************************************************************/
+-- 
+1.7.1
+

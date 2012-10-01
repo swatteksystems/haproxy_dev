@@ -1,0 +1,132 @@
+From 3aaba440a20b711b7edb696abad389ce2205dfaf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Cyril=20Bont=C3=A9?= <cyril.bonte@free.fr>
+Date: Sun, 23 Sep 2012 14:19:12 +0200
+Subject: BUILD: fix compilation error with DEBUG_FULL
+
+Recent changes in structures broke the compilation when using DEBUG_FULL.
+Let's update apply the changes also to the variables used in DPRINTF calls.
+---
+ src/backend.c   |    2 +-
+ src/dumpstats.c |    2 +-
+ src/proto_tcp.c |    4 ++--
+ src/session.c   |   14 +++++++-------
+ 4 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/src/backend.c b/src/backend.c
+index 7ef0a49..a6c0010 100644
+--- a/src/backend.c
++++ b/src/backend.c
+@@ -1144,7 +1144,7 @@ int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
+ 		req,
+ 		req->rex, req->wex,
+ 		req->flags,
+-		req->i,
++		req->buf.i,
+ 		req->analysers);
+ 
+ 	if (s->flags & SN_ASSIGNED)
+diff --git a/src/dumpstats.c b/src/dumpstats.c
+index 48419c1..37dfcbc 100644
+--- a/src/dumpstats.c
++++ b/src/dumpstats.c
+@@ -1614,7 +1614,7 @@ static void cli_io_handler(struct stream_interface *si)
+  out:
+ 	DPRINTF(stderr, "%s@%d: st=%d, rqf=%x, rpf=%x, rqh=%d, rqs=%d, rh=%d, rs=%d\n",
+ 		__FUNCTION__, __LINE__,
+-		si->state, req->flags, res->flags, req->i, req->o, res->i, res->o);
++		si->state, req->flags, res->flags, req->buf.i, req->buf.o, res->buf.i, res->buf.o);
+ 
+ 	if (unlikely(si->state == SI_ST_DIS || si->state == SI_ST_CLO)) {
+ 		/* check that we have released everything then unregister */
+diff --git a/src/proto_tcp.c b/src/proto_tcp.c
+index 1e97e8e..7c3258c 100644
+--- a/src/proto_tcp.c
++++ b/src/proto_tcp.c
+@@ -782,7 +782,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
+ 		req,
+ 		req->rex, req->wex,
+ 		req->flags,
+-		req->i,
++		req->buf.i,
+ 		req->analysers);
+ 
+ 	/* We don't know whether we have enough data, so must proceed
+@@ -901,7 +901,7 @@ int tcp_inspect_response(struct session *s, struct channel *rep, int an_bit)
+ 		rep,
+ 		rep->rex, rep->wex,
+ 		rep->flags,
+-		rep->i,
++		rep->buf.i,
+ 		rep->analysers);
+ 
+ 	/* We don't know whether we have enough data, so must proceed
+diff --git a/src/session.c b/src/session.c
+index 6fb79e3..b98b878 100644
+--- a/src/session.c
++++ b/src/session.c
+@@ -863,7 +863,7 @@ static void sess_update_stream_int(struct session *s, struct stream_interface *s
+ 		s->req, s->rep,
+ 		s->req->rex, s->rep->wex,
+ 		s->req->flags, s->rep->flags,
+-		s->req->i, s->req->o, s->rep->i, s->rep->o, s->rep->cons->state, s->req->cons->state);
++		s->req->buf.i, s->req->buf.o, s->rep->buf.i, s->rep->buf.o, s->rep->cons->state, s->req->cons->state);
+ 
+ 	if (si->state == SI_ST_ASS) {
+ 		/* Server assigned to connection request, we have to try to connect now */
+@@ -1051,7 +1051,7 @@ static void sess_prepare_conn_req(struct session *s, struct stream_interface *si
+ 		s->req, s->rep,
+ 		s->req->rex, s->rep->wex,
+ 		s->req->flags, s->rep->flags,
+-		s->req->i, s->req->o, s->rep->i, s->rep->o, s->rep->cons->state, s->req->cons->state);
++		s->req->buf.i, s->req->buf.o, s->rep->buf.i, s->rep->buf.o, s->rep->cons->state, s->req->cons->state);
+ 
+ 	if (si->state != SI_ST_REQ)
+ 		return;
+@@ -1100,7 +1100,7 @@ static int process_switching_rules(struct session *s, struct channel *req, int a
+ 		req,
+ 		req->rex, req->wex,
+ 		req->flags,
+-		req->i,
++		req->buf.i,
+ 		req->analysers);
+ 
+ 	/* now check whether we have some switching rules for this request */
+@@ -1195,7 +1195,7 @@ static int process_server_rules(struct session *s, struct channel *req, int an_b
+ 		req,
+ 		req->rex, req->wex,
+ 		req->flags,
+-		req->i + req->o,
++		req->buf.i + req->buf.o,
+ 		req->analysers);
+ 
+ 	if (!(s->flags & SN_ASSIGNED)) {
+@@ -1244,7 +1244,7 @@ static int process_sticking_rules(struct session *s, struct channel *req, int an
+ 		req,
+ 		req->rex, req->wex,
+ 		req->flags,
+-		req->i,
++		req->buf.i,
+ 		req->analysers);
+ 
+ 	list_for_each_entry(rule, &px->sticking_rules, list) {
+@@ -1334,7 +1334,7 @@ static int process_store_rules(struct session *s, struct channel *rep, int an_bi
+ 		rep,
+ 		rep->rex, rep->wex,
+ 		rep->flags,
+-		rep->i,
++		rep->buf.i,
+ 		rep->analysers);
+ 
+ 	list_for_each_entry(rule, &px->storersp_rules, list) {
+@@ -1581,7 +1581,7 @@ struct task *process_session(struct task *t)
+ 		s->req, s->rep,
+ 		s->req->rex, s->rep->wex,
+ 		s->req->flags, s->rep->flags,
+-		s->req->i, s->req->o, s->rep->i, s->rep->o, s->rep->cons->state, s->req->cons->state,
++		s->req->buf.i, s->req->buf.o, s->rep->buf.i, s->rep->buf.o, s->rep->cons->state, s->req->cons->state,
+ 		s->rep->cons->err_type, s->req->cons->err_type,
+ 		s->req->cons->conn_retries);
+ 
+-- 
+1.7.1
+

@@ -1,0 +1,58 @@
+From 88500de69edcaf70ea552cd06e0110ff79f68285 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 13 Sep 2012 19:34:38 +0200
+Subject: CLEANUP: listener: remove unused conf->file and conf->line
+
+These ones are already in bind_conf.
+---
+ include/types/listener.h |    2 --
+ src/cfgparse.c           |    6 +-----
+ 2 files changed, 1 insertions(+), 7 deletions(-)
+
+diff --git a/include/types/listener.h b/include/types/listener.h
+index 0985329..2406148 100644
+--- a/include/types/listener.h
++++ b/include/types/listener.h
+@@ -152,8 +152,6 @@ struct listener {
+ 	/* warning: this struct is huge, keep it at the bottom */
+ 	struct sockaddr_storage addr;	/* the address we listen to */
+ 	struct {
+-		const char *file;	/* file where the section appears */
+-		int line;		/* line where the section appears */
+ 		struct eb32_node id;	/* place in the tree of used IDs */
+ 	} conf;				/* config information */
+ };
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 8a7b29a..07b7347 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1455,8 +1455,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 			}
+ 			new = curproxy->listen;
+ 			while (new != last) {
+-				new->conf.file = file;
+-				new->conf.line = linenum;
+ 				new = new->next;
+ 				global.maxsock++;
+ 			}
+@@ -1702,8 +1700,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 		new_listen = curproxy->listen;
+ 		while (new_listen != last_listen) {
+-			new_listen->conf.file = file;
+-			new_listen->conf.line = linenum;
+ 			new_listen->bind_conf = bind_conf;
+ 			new_listen = new_listen->next;
+ 			global.maxsock++;
+@@ -2054,7 +2050,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 				if (node) {
+ 					l = container_of(node, struct listener, conf.id);
+ 					Alert("parsing [%s:%d]: custom id %d for socket '%s' already used at %s:%d.\n",
+-					      file, linenum, l->luid, args[1], l->conf.file, l->conf.line);
++					      file, linenum, l->luid, args[1], l->bind_conf->file, l->bind_conf->line);
+ 					err_code |= ERR_ALERT | ERR_FATAL;
+ 					goto out;
+ 				}
+-- 
+1.7.1
+

@@ -1,0 +1,48 @@
+From 3e394c903f156ab2bcf731df39c4e6e74df3b6b4 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Fri, 14 Sep 2012 23:56:58 +0200
+Subject: BUG/MAJOR: ssl: missing tests in ACL fetch functions
+
+Baptiste Assmann observed a crash of 1.5-dev12 occuring when the ssl_sni
+fetch was used with no SNI on the input connection and without a prior
+has_sni check. A code review revealed several issues :
+   1) it was possible to call the has_sni and ssl_sni fetch functions with
+      a NULL data_ctx if the handshake fails or if the connection is aborted
+      during the handshake.
+   2) when no SNI is present, strlen() was called with a NULL parameter in
+      smp_fetch_ssl_sni().
+---
+ src/ssl_sock.c |    7 +++++--
+ 1 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/ssl_sock.c b/src/ssl_sock.c
+index 91e7fee..4198339 100644
+--- a/src/ssl_sock.c
++++ b/src/ssl_sock.c
+@@ -782,6 +782,7 @@ smp_fetch_has_sni(struct proxy *px, struct session *l4, void *l7, unsigned int o
+ #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
+ 	smp->type = SMP_T_BOOL;
+ 	smp->data.uint = (l4->si[0].conn.data == &ssl_sock) &&
++		l4->si[0].conn.data_ctx &&
+ 		SSL_get_servername(l4->si[0].conn.data_ctx, TLSEXT_NAMETYPE_host_name) != NULL;
+ 	return 1;
+ #else
+@@ -797,11 +798,13 @@ smp_fetch_ssl_sni(struct proxy *px, struct session *l4, void *l7, unsigned int o
+ 	smp->flags = 0;
+ 	smp->type = SMP_T_CSTR;
+ 
+-	if (!l4 || l4->si[0].conn.data != &ssl_sock)
++	if (!l4 || !l4->si[0].conn.data_ctx || l4->si[0].conn.data != &ssl_sock)
+ 		return 0;
+ 
+-	/* data points to cookie value */
+ 	smp->data.str.str = (char *)SSL_get_servername(l4->si[0].conn.data_ctx, TLSEXT_NAMETYPE_host_name);
++	if (!smp->data.str.str)
++		return 0;
++
+ 	smp->data.str.len = strlen(smp->data.str.str);
+ 	return 1;
+ #else
+-- 
+1.7.1
+

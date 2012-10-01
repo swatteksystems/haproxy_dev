@@ -1,0 +1,49 @@
+From ce39bfb7c433f60bc3dd924b699d135c499c0efe Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sat, 22 Sep 2012 18:36:29 +0200
+Subject: BUG: backend: balance hdr was broken since 1.5-dev11
+
+Alex Markham reported and diagnosed a bug appearing on 1.5-dev11,
+causing a crash on x86_64 when header hashing is used. The cause is
+a missing (int) cast causing a negative offset to appear positive
+and the resulting pointer to go out of bounds.
+
+The crash is not possible anymore since 1.5-dev12 because a second
+bug caused the negative sign to disappear so the pointer is always
+within range but always wrong, so balance hdr() never works anymore.
+
+This fix restores the correct behaviour and ensures the sign is
+correct.
+---
+ include/common/buffer.h |    1 +
+ src/backend.c           |    2 +-
+ 2 files changed, 2 insertions(+), 1 deletions(-)
+
+diff --git a/include/common/buffer.h b/include/common/buffer.h
+index e49316e..ae4e680 100644
+--- a/include/common/buffer.h
++++ b/include/common/buffer.h
+@@ -52,6 +52,7 @@ void buffer_bounce_realign(struct buffer *buf);
+  * pointer. It is written so that it is optimal when <ofs> is a const. It is
+  * written as a macro instead of an inline function so that the compiler knows
+  * when it can optimize out the sign test on <ofs> when passed an unsigned int.
++ * Note that callers MUST cast <ofs> to int if they expect negative values.
+  */
+ #define b_ptr(b, ofs) \
+ 	({            \
+diff --git a/src/backend.c b/src/backend.c
+index 29d8145..7ef0a49 100644
+--- a/src/backend.c
++++ b/src/backend.c
+@@ -343,7 +343,7 @@ struct server *get_server_hh(struct session *s)
+ 	ctx.idx = 0;
+ 
+ 	/* if the message is chunked, we skip the chunk size, but use the value as len */
+-	http_find_header2(px->hh_name, plen, b_ptr(&s->req->buf, s->req->buf.o), &txn->hdr_idx, &ctx);
++	http_find_header2(px->hh_name, plen, b_ptr(&s->req->buf, (int)-s->req->buf.o), &txn->hdr_idx, &ctx);
+ 
+ 	/* if the header is not found or empty, let's fallback to round robin */
+ 	if (!ctx.idx || !ctx.vlen)
+-- 
+1.7.1
+

@@ -1,0 +1,76 @@
+From e603e69d187c3cf23cb0b3a845006adb06d659fa Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 27 Sep 2012 22:20:41 +0200
+Subject: MEDIUM: connection: make use of the owner instead of container_of
+
+This way the connection can become independant on the stream interface.
+---
+ src/session.c          |    2 +-
+ src/stream_interface.c |   10 +++++-----
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/session.c b/src/session.c
+index be25ccf..91684ad 100644
+--- a/src/session.c
++++ b/src/session.c
+@@ -260,7 +260,7 @@ static void kill_mini_session(struct session *s)
+  */
+ int conn_session_complete(struct connection *conn, int flag)
+ {
+-	struct session *s = container_of(conn, struct session, si[0].conn);
++	struct session *s = container_of(conn->owner, struct session, si[0]);
+ 
+ 	if (!(conn->flags & CO_FL_ERROR) && (session_complete(s) > 0)) {
+ 		conn->flags &= ~flag;
+diff --git a/src/stream_interface.c b/src/stream_interface.c
+index 8037fb7..78c061c 100644
+--- a/src/stream_interface.c
++++ b/src/stream_interface.c
+@@ -485,7 +485,7 @@ void stream_int_unregister_handler(struct stream_interface *si)
+  */
+ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
+ {
+-	struct stream_interface *si = container_of(conn, struct stream_interface, conn);
++	struct stream_interface *si = conn->owner;
+ 
+ 	/* we might have been called just after an asynchronous shutw */
+ 	if (conn->flags & CO_FL_SOCK_WR_SH)
+@@ -561,7 +561,7 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
+  */
+ void conn_notify_si(struct connection *conn)
+ {
+-	struct stream_interface *si = container_of(conn, struct stream_interface, conn);
++	struct stream_interface *si = conn->owner;
+ 
+ 	DPRINTF(stderr, "%s: si=%p, si->state=%d ib->flags=%08x ob->flags=%08x\n",
+ 		__FUNCTION__,
+@@ -665,7 +665,7 @@ void conn_notify_si(struct connection *conn)
+  */
+ static int si_conn_send_loop(struct connection *conn)
+ {
+-	struct stream_interface *si = container_of(conn, struct stream_interface, conn);
++	struct stream_interface *si = conn->owner;
+ 	struct channel *b = si->ob;
+ 	int write_poll = MAX_WRITE_POLL_LOOPS;
+ 	int ret;
+@@ -940,7 +940,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
+  */
+ void si_conn_recv_cb(struct connection *conn)
+ {
+-	struct stream_interface *si = container_of(conn, struct stream_interface, conn);
++	struct stream_interface *si = conn->owner;
+ 	struct channel *b = si->ib;
+ 	int ret, max, cur_read;
+ 	int read_poll = MAX_READ_POLL_LOOPS;
+@@ -1154,7 +1154,7 @@ void si_conn_recv_cb(struct connection *conn)
+  */
+ void si_conn_send_cb(struct connection *conn)
+ {
+-	struct stream_interface *si = container_of(conn, struct stream_interface, conn);
++	struct stream_interface *si = conn->owner;
+ 	struct channel *b = si->ob;
+ 
+ 	if (conn->flags & CO_FL_ERROR)
+-- 
+1.7.1
+

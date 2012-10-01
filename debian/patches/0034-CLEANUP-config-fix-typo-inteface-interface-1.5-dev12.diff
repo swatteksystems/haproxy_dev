@@ -1,0 +1,26 @@
+From 3631d4177884107788e20da6e340812737c4c857 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Tue, 25 Sep 2012 16:31:00 +0200
+Subject: CLEANUP: config: fix typo inteface => interface
+
+This was in an error message.
+---
+ src/cfgparse.c |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index cd3a559..8a04499 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -4848,7 +4848,7 @@ stats_error_parsing:
+ 				continue;
+ 			}
+ 			Alert("parsing [%s:%d] : '%s' only supports optional keywords '%s' and '%s'.\n",
+-			      file, linenum, args[0], "inteface", "usesrc");
++			      file, linenum, args[0], "interface", "usesrc");
+ 			err_code |= ERR_ALERT | ERR_FATAL;
+ 			goto out;
+ 		}
+-- 
+1.7.1
+

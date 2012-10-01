@@ -1,0 +1,37 @@
+From a7944ad9efb74cff9d67f16d1c658bb26d54bdd3 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Wed, 26 Sep 2012 21:03:11 +0200
+Subject: BUG: stats: fix regression introduced by commit 4348fad1
+
+Recent commit 4348fad1 (listeners: use dual-linked lists to chain listeners
+with frontends) broke frontend lookup in stats sockets by using the wrong
+iterator in the listeners.
+---
+ src/dumpstats.c |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/dumpstats.c b/src/dumpstats.c
+index 37dfcbc..7c01e79 100644
+--- a/src/dumpstats.c
++++ b/src/dumpstats.c
+@@ -944,7 +944,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 						sv->counters.sps_max = 0;
+ 					}
+ 
+-				list_for_each_entry(li, &px->conf.listeners, by_bind)
++				list_for_each_entry(li, &px->conf.listeners, by_fe)
+ 					if (li->counters) {
+ 						if (clrall)
+ 							memset(li->counters, 0, sizeof(*li->counters));
+@@ -1124,7 +1124,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 				 * its listeners. The blocked ones will be dequeued.
+ 				 */
+ 				px->maxconn = v;
+-				list_for_each_entry(l, &px->conf.listeners, by_bind) {
++				list_for_each_entry(l, &px->conf.listeners, by_fe) {
+ 					l->maxconn = v;
+ 					if (l->state == LI_FULL)
+ 						resume_listener(l);
+-- 
+1.7.1
+

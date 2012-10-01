@@ -1,0 +1,28 @@
+From 086fbf53b55f9eee642de68536801ddd74e694bf Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Mon, 24 Sep 2012 20:34:51 +0200
+Subject: DOC: fix index to reference bind and server options
+
+Last commit forgot to update the index.
+---
+ doc/configuration.txt |    4 +++-
+ 1 files changed, 3 insertions(+), 1 deletions(-)
+
+diff --git a/doc/configuration.txt b/doc/configuration.txt
+index 149c0c8..a270d69 100644
+--- a/doc/configuration.txt
++++ b/doc/configuration.txt
+@@ -53,7 +53,9 @@ Summary
+ 4.1.      Proxy keywords matrix
+ 4.2.      Alphabetically sorted keywords reference
+ 
+-5.    Server and default-server options
++5.    Bind and Server options
++5.1.      Bind options
++5.2.      Server and default-server options
+ 
+ 6.    HTTP header manipulation
+ 
+-- 
+1.7.1
+

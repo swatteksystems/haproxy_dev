@@ -1,0 +1,34 @@
+From aeff252dcac84a82d1688e8ac3d00dad85ca4a50 Mon Sep 17 00:00:00 2001
+From: Guillaume Castagnino <casta@xwing.info>
+Date: Thu, 13 Sep 2012 15:02:53 +0200
+Subject: DOC: duplicate ssl_sni section
+
+I noticed that the ssl_sni section is duplicated in configuration. Here
+is the (very) small fix.
+---
+ doc/configuration.txt |    9 ---------
+ 1 files changed, 0 insertions(+), 9 deletions(-)
+
+diff --git a/doc/configuration.txt b/doc/configuration.txt
+index 7be3335..227b50f 100644
+--- a/doc/configuration.txt
++++ b/doc/configuration.txt
+@@ -8085,15 +8085,6 @@ req_ssl_ver <decimal>
+   SSL data layer, so this will not work with "bind" lines having the "ssl"
+   option.
+ 
+-ssl_sni <string>
+-  Returns true when the incoming connection was made over an SSL/TLS data layer
+-  which deciphered it and found a Server Name Indication TLS extension sent by
+-  the client, matching the specified string. In HTTPS, the SNI field (when
+-  present) is equal to the requested host name. This match is different from
+-  req_ssl_sni above in that it applies to the connection being deciphered by
+-  haproxy and not to SSL contents being blindly forwarded. This requires that
+-  the SSL library is build with support for TLS extensions (check haproxy -vv).
+-
+ ssl_has_sni
+   This is used to check for presence of a Server Name Indication TLS extension
+   in an incoming connection was made over an SSL/TLS data layer. Returns true
+-- 
+1.7.1
+

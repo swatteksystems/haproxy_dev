@@ -1,0 +1,312 @@
+From 4479124cdafa148681e09c229b2decac8dcb16f6 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Wed, 12 Sep 2012 23:27:21 +0200
+Subject: MEDIUM: config: move the "bind" TCP parameters to proto_tcp
+
+Now proto_tcp.c is responsible for the 4 settings it handles :
+  - defer-accept
+  - interface
+  - mss
+  - transparent
+
+These ones do not need to be handled in cfgparse anymore. If support for a
+setting is disabled by a missing build option, then cfgparse correctly
+reports :
+
+  [ALERT] 255/232700 (2701) : parsing [echo.cfg:114] : 'bind' : 'transparent' option is not implemented in this version (check build options).
+---
+ src/cfgparse.c  |  115 ------------------------------------------------
+ src/proto_tcp.c |  130 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 130 insertions(+), 115 deletions(-)
+
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index c0b29c6..c316bed 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -23,8 +23,6 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
+-#include <netinet/tcp.h>
+-
+ #include <common/cfgparse.h>
+ #include <common/chunk.h>
+ #include <common/config.h>
+@@ -1713,119 +1711,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 		while (*(args[cur_arg])) {
+ 			struct bind_kw *kw;
+ 
+-			if (!strcmp(args[cur_arg], "interface")) { /* specifically bind to this interface */
+-#ifdef SO_BINDTODEVICE
+-				struct listener *l;
+-
+-				if (curproxy->listen->addr.ss_family == AF_UNIX) {
+-					Alert("parsing [%s:%d] : '%s' : '%s' option not supported on unix sockets.\n",
+-					      file, linenum, args[0], args[cur_arg]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				if (!*args[cur_arg + 1]) {
+-					Alert("parsing [%s:%d] : '%s' : missing interface name.\n",
+-					      file, linenum, args[0]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-				
+-				for (l = curproxy->listen; l != last_listen; l = l->next)
+-					l->interface = strdup(args[cur_arg + 1]);
+-
+-				global.last_checks |= LSTCHK_NETADM;
+-
+-				cur_arg += 2;
+-				continue;
+-#else
+-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
+-				      file, linenum, args[0], args[cur_arg]);
+-				err_code |= ERR_ALERT | ERR_FATAL;
+-				goto out;
+-#endif
+-			}
+-			if (!strcmp(args[cur_arg], "mss")) { /* set MSS of listening socket */
+-#ifdef TCP_MAXSEG
+-				struct listener *l;
+-				int mss;
+-
+-				if (curproxy->listen->addr.ss_family == AF_UNIX) {
+-					Alert("parsing [%s:%d] : '%s' : '%s' option not supported on unix sockets.\n",
+-					      file, linenum, args[0], args[cur_arg]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				if (!*args[cur_arg + 1]) {
+-					Alert("parsing [%s:%d] : '%s' : missing MSS value.\n",
+-					      file, linenum, args[0]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				mss = atoi(args[cur_arg + 1]);
+-				if (!mss || abs(mss) > 65535) {
+-					Alert("parsing [%s:%d]: %s expects an MSS with and absolute value between 1 and 65535.\n",
+-					      file, linenum, args[0]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				for (l = curproxy->listen; l != last_listen; l = l->next)
+-					l->maxseg = mss;
+-
+-				cur_arg += 2;
+-				continue;
+-#else
+-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
+-				      file, linenum, args[0], args[cur_arg]);
+-				err_code |= ERR_ALERT | ERR_FATAL;
+-				goto out;
+-#endif
+-			}
+-
+-			if (!strcmp(args[cur_arg], "defer-accept")) { /* wait for some data for 1 second max before doing accept */
+-#ifdef TCP_DEFER_ACCEPT
+-				struct listener *l;
+-
+-				for (l = curproxy->listen; l != last_listen; l = l->next)
+-					l->options |= LI_O_DEF_ACCEPT;
+-
+-				cur_arg ++;
+-				continue;
+-#else
+-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
+-				      file, linenum, args[0], args[cur_arg]);
+-				err_code |= ERR_ALERT | ERR_FATAL;
+-				goto out;
+-#endif
+-			}
+-
+-			if (!strcmp(args[cur_arg], "transparent")) { /* transparently bind to these addresses */
+-#ifdef CONFIG_HAP_LINUX_TPROXY
+-				struct listener *l;
+-
+-				if (curproxy->listen->addr.ss_family == AF_UNIX) {
+-					Alert("parsing [%s:%d] : '%s' : '%s' option not supported on unix sockets.\n",
+-					      file, linenum, args[0], args[cur_arg]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				for (l = curproxy->listen; l != last_listen; l = l->next)
+-					l->options |= LI_O_FOREIGN;
+-
+-				cur_arg ++;
+-				continue;
+-#else
+-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
+-				      file, linenum, args[0], args[cur_arg]);
+-				err_code |= ERR_ALERT | ERR_FATAL;
+-				goto out;
+-#endif
+-			}
+-
+ 			if (!strcmp(args[cur_arg], "maxconn")) {
+ 				struct listener *l;
+ 				int val;
+diff --git a/src/proto_tcp.c b/src/proto_tcp.c
+index 092db69..fe89569 100644
+--- a/src/proto_tcp.c
++++ b/src/proto_tcp.c
+@@ -1697,6 +1697,103 @@ static int val_payload_lv(struct arg *arg, char **err_msg)
+ 	return 1;
+ }
+ 
++#ifdef CONFIG_HAP_LINUX_TPROXY
++/* parse the "transparent" bind keyword */
++static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++
++	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	for (l = px->listen; l != last; l = l->next)
++		l->options |= LI_O_FOREIGN;
++
++	return 0;
++}
++#endif
++
++#ifdef TCP_DEFER_ACCEPT
++/* parse the "defer-accept" bind keyword */
++static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++
++	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	for (l = px->listen; l != last; l = l->next)
++		l->options |= LI_O_DEF_ACCEPT;
++
++	return 0;
++}
++#endif
++
++#ifdef TCP_MAXSEG
++/* parse the "mss" bind keyword */
++static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++	int mss;
++
++	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	if (!*args[cur_arg + 1]) {
++		if (err)
++			memprintf(err, "'%s' : missing MSS value", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	mss = atoi(args[cur_arg + 1]);
++	if (!mss || abs(mss) > 65535) {
++		if (err)
++			memprintf(err, "'%s' : expects an MSS with and absolute value between 1 and 65535", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	for (l = px->listen; l != last; l = l->next)
++		l->maxseg = mss;
++
++	return 0;
++}
++#endif
++
++#ifdef SO_BINDTODEVICE
++/* parse the "mss" bind keyword */
++static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++
++	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	if (!*args[cur_arg + 1]) {
++		if (err)
++			memprintf(err, "'%s' : missing interface name", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	for (l = px->listen; l != last; l = l->next)
++		l->interface = strdup(args[cur_arg + 1]);
++
++	global.last_checks |= LSTCHK_NETADM;
++	return 0;
++}
++#endif
++
+ static struct cfg_kw_list cfg_kws = {{ },{
+ 	{ CFG_LISTEN, "tcp-request", tcp_parse_tcp_req },
+ 	{ CFG_LISTEN, "tcp-response", tcp_parse_tcp_rep },
+@@ -1734,6 +1831,38 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
+ 	{ NULL, NULL, 0, 0, 0 },
+ }};
+ 
++/************************************************************************/
++/*           All supported bind keywords must be declared here.         */
++/************************************************************************/
++
++/* Note: must not be declared <const> as its list will be overwritten.
++ * Please take care of keeping this list alphabetically sorted, doing so helps
++ * all code contributors.
++ * Optional keywords are also declared with a NULL ->parse() function so that
++ * the config parser can report an appropriate error when a known keyword was
++ * not enabled.
++ */
++static struct bind_kw_list bind_kws = {{ },{
++#ifdef TCP_DEFER_ACCEPT
++	{ "defer-accept",  bind_parse_defer_accept, 0 }, /* wait for some data for 1 second max before doing accept */
++#endif
++#ifdef SO_BINDTODEVICE
++	{ "interface",     bind_parse_interface,    1 }, /* specifically bind to this interface */
++#endif
++#ifdef TCP_MAXSEG
++	{ "mss",           bind_parse_mss,          1 }, /* set MSS of listening socket */
++#endif
++#ifdef CONFIG_HAP_LINUX_TPROXY
++	{ "transparent",   bind_parse_transparent,  0 }, /* transparently bind to the specified addresses */
++#endif
++	/* the versions with the NULL parse function*/
++	{ "defer-accept",  NULL,  0 },
++	{ "interface",     NULL,  1 },
++	{ "mss",           NULL,  1 },
++	{ "transparent",   NULL,  0 },
++	{ NULL, NULL, 0 },
++}};
++
+ __attribute__((constructor))
+ static void __tcp_protocol_init(void)
+ {
+@@ -1742,6 +1871,7 @@ static void __tcp_protocol_init(void)
+ 	sample_register_fetches(&sample_fetch_keywords);
+ 	cfg_register_keywords(&cfg_kws);
+ 	acl_register_keywords(&acl_kws);
++	bind_register_keywords(&bind_kws);
+ }
+ 
+ 
+-- 
+1.7.1
+

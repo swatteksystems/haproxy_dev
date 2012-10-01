@@ -1,0 +1,300 @@
+From d0a895d25f4900ed574910b15e8899689e80bec0 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Tue, 18 Sep 2012 17:40:35 +0200
+Subject: MEDIUM: config: move all unix-specific bind keywords to proto_uxst.c
+
+The "mode", "uid", "gid", "user" and "group" bind options were moved to
+proto_uxst as they are unix-specific.
+
+Note that previous versions had a bug here, only the last listener was
+updated with the specified settings. However, it almost never happens
+that bind lines contain multiple UNIX socket paths so this is not that
+much of a problem anyway.
+---
+ src/cfgparse.c   |   88 ------------------------------
+ src/proto_uxst.c |  156 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 156 insertions(+), 88 deletions(-)
+
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 8ce5ab6..08780ff 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1710,94 +1710,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 		cur_arg = 2;
+ 		while (*(args[cur_arg])) {
+ 			struct bind_kw *kw;
+-
+-			if (!strcmp(args[cur_arg], "mode")) {
+-
+-				if (curproxy->listen->addr.ss_family != AF_UNIX) {
+-					Alert("parsing [%s:%d] : '%s %s' : '%s' option only supported on unix sockets.\n",
+-					      file, linenum, args[0], args[1], args[cur_arg]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				curproxy->listen->perm.ux.mode = strtol(args[cur_arg + 1], NULL, 8);
+-
+-				cur_arg += 2;
+-				continue;
+-			}
+-
+-			if (!strcmp(args[cur_arg], "uid")) {
+-
+-                                if (curproxy->listen->addr.ss_family != AF_UNIX) {
+-                                        Alert("parsing [%s:%d] : '%s %s' : '%s' option only supported on unix sockets.\n",
+-					      file, linenum, args[0], args[1], args[cur_arg]);
+-                                        err_code |= ERR_ALERT | ERR_FATAL;
+-                                        goto out;
+-                                }
+-
+-                                curproxy->listen->perm.ux.uid = atol(args[cur_arg + 1 ]);
+-                                cur_arg += 2;
+-                                continue;
+-                        }
+-
+-			if (!strcmp(args[cur_arg], "gid")) {
+-
+-                                if (curproxy->listen->addr.ss_family != AF_UNIX) {
+-                                        Alert("parsing [%s:%d] : '%s %s' : '%s' option only supported on unix sockets.\n",
+-					      file, linenum, args[0], args[1], args[cur_arg]);
+-                                        err_code |= ERR_ALERT | ERR_FATAL;
+-                                        goto out;
+-                                }
+-
+-                                curproxy->listen->perm.ux.gid = atol(args[cur_arg + 1 ]);
+-                                cur_arg += 2;
+-                                continue;
+-                        }
+-
+-			if (!strcmp(args[cur_arg], "user")) {
+-				struct passwd *user;
+-
+-				if (curproxy->listen->addr.ss_family != AF_UNIX) {
+-					Alert("parsing [%s:%d] : '%s %s' : '%s' option only supported on unix sockets.\n",
+-					      file, linenum, args[0], args[1], args[cur_arg]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-				user = getpwnam(args[cur_arg + 1]);
+-				if (!user) {
+-					Alert("parsing [%s:%d] : '%s %s' : '%s' unknown user.\n",
+-					      file, linenum, args[0], args[1], args[cur_arg + 1 ]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				curproxy->listen->perm.ux.uid = user->pw_uid;
+-				cur_arg += 2;
+-				continue;
+-                        }
+-
+-			if (!strcmp(args[cur_arg], "group")) {
+-				struct group *group;
+-
+-				if (curproxy->listen->addr.ss_family != AF_UNIX) {
+-					Alert("parsing [%s:%d] : '%s %s' : '%s' option only supported on unix sockets.\n",
+-					      file, linenum, args[0], args[1], args[cur_arg]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-				group = getgrnam(args[cur_arg + 1]);
+-				if (!group) {
+-					Alert("parsing [%s:%d] : '%s %s' : '%s' unknown group.\n",
+-					      file, linenum, args[0], args[1], args[cur_arg + 1 ]);
+-					err_code |= ERR_ALERT | ERR_FATAL;
+-					goto out;
+-				}
+-
+-				curproxy->listen->perm.ux.gid = group->gr_gid;
+-				cur_arg += 2;
+-				continue;
+-                        }
+-
+ 			kw = bind_find_kw(args[cur_arg]);
+ 			if (kw) {
+ 				char *err = NULL;
+diff --git a/src/proto_uxst.c b/src/proto_uxst.c
+index ed05e02..3ea468f 100644
+--- a/src/proto_uxst.c
++++ b/src/proto_uxst.c
+@@ -13,6 +13,8 @@
+ #include <ctype.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <pwd.h>
++#include <grp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -346,6 +348,159 @@ static int uxst_unbind_listeners(struct protocol *proto)
+ 	return ERR_NONE;
+ }
+ 
++/* parse the "mode" bind keyword */
++static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++	int val;
++
++	if (px->listen->addr.ss_family != AF_UNIX) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	if (!*args[cur_arg + 1]) {
++		if (err)
++			memprintf(err, "'%s' : missing mode (octal integer expected)", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	val = strtol(args[cur_arg + 1], NULL, 8);
++
++	for (l = px->listen; l != last; l = l->next)
++		l->perm.ux.mode = val;
++
++	return 0;
++}
++
++/* parse the "gid" bind keyword */
++static int bind_parse_gid(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++	int val;
++
++	if (px->listen->addr.ss_family != AF_UNIX) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	if (!*args[cur_arg + 1]) {
++		if (err)
++			memprintf(err, "'%s' : missing value", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	val = atol(args[cur_arg + 1]);
++	for (l = px->listen; l != last; l = l->next)
++		l->perm.ux.gid = val;
++
++	return 0;
++}
++
++/* parse the "group" bind keyword */
++static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++	struct group *group;
++
++	if (px->listen->addr.ss_family != AF_UNIX) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	if (!*args[cur_arg + 1]) {
++		if (err)
++			memprintf(err, "'%s' : missing group name", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	group = getgrnam(args[cur_arg + 1]);
++	if (!group) {
++		if (err)
++			memprintf(err, "'%s' : unknown group name '%s'", args[cur_arg], args[cur_arg + 1]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	for (l = px->listen; l != last; l = l->next)
++		l->perm.ux.gid = group->gr_gid;
++
++	return 0;
++}
++
++/* parse the "uid" bind keyword */
++static int bind_parse_uid(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++	int val;
++
++	if (px->listen->addr.ss_family != AF_UNIX) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	if (!*args[cur_arg + 1]) {
++		if (err)
++			memprintf(err, "'%s' : missing value", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	val = atol(args[cur_arg + 1]);
++	for (l = px->listen; l != last; l = l->next)
++		l->perm.ux.uid = val;
++
++	return 0;
++}
++
++/* parse the "user" bind keyword */
++static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++{
++	struct listener *l;
++	struct passwd *user;
++
++	if (px->listen->addr.ss_family != AF_UNIX) {
++		if (err)
++			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	if (!*args[cur_arg + 1]) {
++		if (err)
++			memprintf(err, "'%s' : missing user name", args[cur_arg]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	user = getpwnam(args[cur_arg + 1]);
++	if (!user) {
++		if (err)
++			memprintf(err, "'%s' : unknown user name '%s'", args[cur_arg], args[cur_arg + 1]);
++		return ERR_ALERT | ERR_FATAL;
++	}
++
++	for (l = px->listen; l != last; l = l->next)
++		l->perm.ux.uid = user->pw_uid;
++
++	return 0;
++}
++
++/* Note: must not be declared <const> as its list will be overwritten.
++ * Please take care of keeping this list alphabetically sorted, doing so helps
++ * all code contributors.
++ * Optional keywords are also declared with a NULL ->parse() function so that
++ * the config parser can report an appropriate error when a known keyword was
++ * not enabled.
++ */
++static struct bind_kw_list bind_kws = {{ },{
++	{ "gid",   bind_parse_gid,   1 },      /* set the socket's gid */
++	{ "group", bind_parse_group, 1 },      /* set the socket's gid from the group name */
++	{ "mode",  bind_parse_mode,  1 },      /* set the socket's mode (eg: 0644)*/
++	{ "uid",   bind_parse_uid,   1 },      /* set the socket's uid */
++	{ "user",  bind_parse_user,  1 },      /* set the socket's uid from the user name */
++	{ NULL, NULL, 0 },
++}};
+ 
+ /********************************
+  * 4) high-level functions
+@@ -355,6 +510,7 @@ __attribute__((constructor))
+ static void __uxst_protocol_init(void)
+ {
+ 	protocol_register(&proto_unix);
++	bind_register_keywords(&bind_kws);
+ }
+ 
+ 
+-- 
+1.7.1
+

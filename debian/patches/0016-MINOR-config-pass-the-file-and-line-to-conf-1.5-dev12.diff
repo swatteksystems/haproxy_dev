@@ -1,0 +1,114 @@
+From 28a47d64086a475456c0ca918474aa2fd59ed328 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Tue, 18 Sep 2012 20:02:48 +0200
+Subject: MINOR: config: pass the file and line to config keyword parsers
+
+This will be needed when we need to create bind config settings.
+---
+ include/common/cfgparse.h |    2 ++
+ src/cfgparse.c            |    4 ++--
+ src/dumpstats.c           |    3 ++-
+ src/proto_tcp.c           |    6 ++++--
+ src/proxy.c               |    6 ++++--
+ 5 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/include/common/cfgparse.h b/include/common/cfgparse.h
+index 118d098..e7ba8d1 100644
+--- a/include/common/cfgparse.h
++++ b/include/common/cfgparse.h
+@@ -43,6 +43,8 @@ struct cfg_keyword {
+ 		     int section_type,          /* current section CFG_{GLOBAL|LISTEN} */
+ 		     struct proxy *curpx,       /* current proxy (NULL in GLOBAL) */
+ 		     struct proxy *defpx,       /* default proxy (NULL in GLOBAL) */
++		     const char *file,          /* config file name */
++		     int line,                  /* config file line number */
+ 		     char **err);               /* error or warning message output pointer */
+ };
+ 
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 6a12d40..08c88d4 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1069,7 +1069,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
+ 					/* prepare error message just in case */
+ 					snprintf(trash, trashlen,
+ 						 "error near '%s' in '%s' section", args[0], "global");
+-					rc = kwl->kw[index].parse(args, CFG_GLOBAL, NULL, NULL, &errmsg);
++					rc = kwl->kw[index].parse(args, CFG_GLOBAL, NULL, NULL, file, linenum, &errmsg);
+ 					if (rc < 0) {
+ 						Alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+ 						err_code |= ERR_ALERT | ERR_FATAL;
+@@ -5184,7 +5184,7 @@ stats_error_parsing:
+ 					/* prepare error message just in case */
+ 					snprintf(trash, trashlen,
+ 						 "error near '%s' in %s section", args[0], cursection);
+-					rc = kwl->kw[index].parse(args, CFG_LISTEN, curproxy, &defproxy, &errmsg);
++					rc = kwl->kw[index].parse(args, CFG_LISTEN, curproxy, &defproxy, file, linenum, &errmsg);
+ 					if (rc < 0) {
+ 						Alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+ 						err_code |= ERR_ALERT | ERR_FATAL;
+diff --git a/src/dumpstats.c b/src/dumpstats.c
+index e28f808..8564e2d 100644
+--- a/src/dumpstats.c
++++ b/src/dumpstats.c
+@@ -177,7 +177,8 @@ static struct proxy *alloc_stats_fe(const char *name)
+  * the first word after "stats".
+  */
+ static int stats_parse_global(char **args, int section_type, struct proxy *curpx,
+-			      struct proxy *defpx, char **err)
++                              struct proxy *defpx, const char *file, int line,
++                              char **err)
+ {
+ 	if (!strcmp(args[1], "socket")) {
+ 		struct sockaddr_un *su;
+diff --git a/src/proto_tcp.c b/src/proto_tcp.c
+index 6b1b15e..79e4d0d 100644
+--- a/src/proto_tcp.c
++++ b/src/proto_tcp.c
+@@ -1167,7 +1167,8 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
+  * keyword.
+  */
+ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
+-                             struct proxy *defpx, char **err)
++                             struct proxy *defpx, const char *file, int line,
++                             char **err)
+ {
+ 	const char *ptr = NULL;
+ 	unsigned int val;
+@@ -1248,7 +1249,8 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
+  * keyword.
+  */
+ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
+-                             struct proxy *defpx, char **err)
++                             struct proxy *defpx, const char *file, int line,
++                             char **err)
+ {
+ 	const char *ptr = NULL;
+ 	unsigned int val;
+diff --git a/src/proxy.c b/src/proxy.c
+index 307af93..35e58b0 100644
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -133,7 +133,8 @@ int get_backend_server(const char *bk_name, const char *sv_name,
+  * "{cli|srv|con}timeout" in args[0].
+  */
+ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
+-                               struct proxy *defpx, char **err)
++                               struct proxy *defpx, const char *file, int line,
++                               char **err)
+ {
+ 	unsigned timeout;
+ 	int retval, cap;
+@@ -229,7 +230,8 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
+  * parsed, and <defpx> to the default proxy or NULL.
+  */
+ static int proxy_parse_rate_limit(char **args, int section, struct proxy *proxy,
+-                                  struct proxy *defpx, char **err)
++                                  struct proxy *defpx, const char *file, int line,
++                                  char **err)
+ {
+ 	int retval, cap;
+ 	char *res;
+-- 
+1.7.1
+

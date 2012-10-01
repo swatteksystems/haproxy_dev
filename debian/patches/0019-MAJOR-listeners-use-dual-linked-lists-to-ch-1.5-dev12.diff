@@ -1,0 +1,1015 @@
+From 4348fad1c1b89c44f8e9fd4b9a9b88b12c131768 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 20 Sep 2012 16:48:07 +0200
+Subject: MAJOR: listeners: use dual-linked lists to chain listeners with frontends
+
+Navigating through listeners was very inconvenient and error-prone. Not to
+mention that listeners were linked in reverse order and reverted afterwards.
+In order to definitely get rid of these issues, we now do the following :
+  - frontends have a dual-linked list of bind_conf
+  - frontends have a dual-linked list of listeners
+  - bind_conf have a dual-linked list of listeners
+  - listeners have a pointer to their bind_conf
+
+This way we can now navigate from anywhere to anywhere and always find the
+proper bind_conf for a given listener, as well as find the list of listeners
+for a current bind_conf.
+---
+ include/proto/listener.h         |    1 +
+ include/types/listener.h         |   11 ++--
+ include/types/proxy.h            |    2 +-
+ include/types/stream_interface.h |    2 +-
+ src/cfgparse.c                   |  100 ++++++++++++++++---------------------
+ src/dumpstats.c                  |   20 +++++---
+ src/haproxy.c                    |   16 ++----
+ src/listener.c                   |   37 +++++++-------
+ src/peers.c                      |    6 ++-
+ src/proto_tcp.c                  |   52 +++++++-------------
+ src/proto_uxst.c                 |   70 +++++++++-----------------
+ src/proxy.c                      |    9 ++--
+ src/ssl_sock.c                   |   24 +++++-----
+ 13 files changed, 153 insertions(+), 197 deletions(-)
+
+diff --git a/include/proto/listener.h b/include/proto/listener.h
+index bd57189..d7b21d5 100644
+--- a/include/proto/listener.h
++++ b/include/proto/listener.h
+@@ -131,6 +131,7 @@ static inline struct bind_conf *bind_conf_alloc(struct list *lh, const char *fil
+ 		LIST_ADDQ(lh, &bind_conf->by_fe);
+ 	if (arg)
+ 		bind_conf->arg = strdup(arg);
++	LIST_INIT(&bind_conf->listeners);
+ 	return bind_conf;
+ }
+ 
+diff --git a/include/types/listener.h b/include/types/listener.h
+index fda7cea..b8d64c4 100644
+--- a/include/types/listener.h
++++ b/include/types/listener.h
+@@ -106,6 +106,7 @@ struct bind_conf {
+ #endif
+ 	int is_ssl;                /* SSL is required for these listeners */
+ 	struct list by_fe;         /* next binding for the same frontend, or NULL */
++	struct list listeners;     /* list of listeners using this bind config */
+ 	char *arg;                 /* argument passed to "bind" for better error reporting */
+ 	char *file;                /* file where the section appears */
+ 	int line;                  /* line where the section appears */
+@@ -127,7 +128,6 @@ struct listener {
+ 	int nbconn;			/* current number of connections on this listener */
+ 	int maxconn;			/* maximum connections allowed on this listener */
+ 	unsigned int backlog;		/* if set, listen backlog */
+-	struct listener *next;		/* next address for the same proxy, or NULL */
+ 	struct list proto_list;         /* list in the protocol header */
+ 	int (*accept)(struct listener *l, int fd, struct sockaddr_storage *addr); /* upper layer's accept() */
+ 	struct task * (*handler)(struct task *t); /* protocol handler. It is a task */
+@@ -147,6 +147,8 @@ struct listener {
+ 	char *interface;		/* interface name or NULL */
+ 	int maxseg;			/* for TCP, advertised MSS */
+ 
++	struct list by_fe;              /* chaining in frontend's list of listeners */
++	struct list by_bind;            /* chaining in bind_conf's list of listeners */
+ 	struct bind_conf *bind_conf;	/* "bind" line settings, include SSL settings among other things */
+ 
+ 	/* warning: this struct is huge, keep it at the bottom */
+@@ -159,13 +161,12 @@ struct listener {
+ /* Descriptor for a "bind" keyword. The ->parse() function returns 0 in case of
+  * success, or a combination of ERR_* flags if an error is encountered. The
+  * function pointer can be NULL if not implemented. The function also has an
+- * access to the current "bind" conf, which is the conf of the last listener,
+- * reachable via px->listen->bind_conf. The ->skip value tells the parser how
+- * many words have to be skipped after the keyword.
++ * access to the current "bind" config line. The ->skip value tells the parser
++ * how many words have to be skipped after the keyword.
+  */
+ struct bind_kw {
+ 	const char *kw;
+-	int (*parse)(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err);
++	int (*parse)(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err);
+ 	int skip; /* nb of args to skip */
+ };
+ 
+diff --git a/include/types/proxy.h b/include/types/proxy.h
+index dde002a..5c078d9 100644
+--- a/include/types/proxy.h
++++ b/include/types/proxy.h
+@@ -200,7 +200,6 @@ struct error_snapshot {
+ };
+ 
+ struct proxy {
+-	struct listener *listen;		/* the listen addresses and sockets */
+ 	struct in_addr mon_net, mon_mask;	/* don't forward connections from this net (network order) FIXME: should support IPv6 */
+ 	int state;				/* proxy state */
+ 	int options;				/* PR_O_REDISP, PR_O_TRANSP, ... */
+@@ -361,6 +360,7 @@ struct proxy {
+ 		struct eb_root used_listener_id;/* list of listener IDs in use */
+ 		struct eb_root used_server_id;	/* list of server IDs in use */
+ 		struct list bind;		/* list of bind settings */
++		struct list listeners;		/* list of listeners belonging to this frontend */
+ 	} conf;					/* config information */
+ 	void *parent;				/* parent of the proxy when applicable */
+ };
+diff --git a/include/types/stream_interface.h b/include/types/stream_interface.h
+index 8b069c8..728447e 100644
+--- a/include/types/stream_interface.h
++++ b/include/types/stream_interface.h
+@@ -122,7 +122,7 @@ struct stream_interface {
+ 			struct {
+ 				struct proxy *px;
+ 				struct server *sv;
+-				struct listener *l;
++				void *l;
+ 				int px_st;		/* STAT_PX_ST* */
+ 				unsigned int flags;	/* STAT_* */
+ 				int iid, type, sid;	/* proxy id, type and service id if bounding of stats is enabled */
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index d2f0dcf..07cc837 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -192,7 +192,7 @@ static struct cfg_kw_list cfg_keywords = {
+  * This can be repeated as many times as necessary, separated by a coma.
+  * Function returns 1 for success or 0 if error.
+  */
+-static int str2listener(char *str, struct proxy *curproxy, const char *file, int line)
++static int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf, const char *file, int line)
+ {
+ 	struct listener *l;
+ 	char *next, *dupstr;
+@@ -266,8 +266,10 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
+ 
+ 		for (; port <= end; port++) {
+ 			l = (struct listener *)calloc(1, sizeof(struct listener));
+-			l->next = curproxy->listen;
+-			curproxy->listen = l;
++			LIST_ADDQ(&curproxy->conf.listeners, &l->by_fe);
++			LIST_ADDQ(&bind_conf->listeners, &l->by_bind);
++			l->frontend = curproxy;
++			l->bind_conf = bind_conf;
+ 
+ 			l->fd = -1;
+ 			l->addr = ss;
+@@ -1212,6 +1214,8 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
+ 	static struct peers *curpeers = NULL;
+ 	struct peer *newpeer = NULL;
+ 	const char *err;
++	struct bind_conf *bind_conf;
++	struct listener *l;
+ 	int err_code = 0;
+ 
+ 	if (strcmp(args[0], "peers") == 0) { /* new peers section */
+@@ -1340,19 +1344,24 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
+ 				curpeers->peers_fe->timeout.connect = 5000;
+ 				curpeers->peers_fe->accept = peer_accept;
+ 				curpeers->peers_fe->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON | PR_O2_SMARTACC;
+-				if (!str2listener(args[2], curpeers->peers_fe, file, linenum)) {
++
++				bind_conf = bind_conf_alloc(&curpeers->peers_fe->conf.bind, file, linenum, args[2]);
++
++				if (!str2listener(args[2], curpeers->peers_fe, bind_conf, file, linenum)) {
+ 					err_code |= ERR_FATAL;
+ 					goto out;
+ 				}
+-				curpeers->peers_fe->listen->maxconn = ((struct proxy *)curpeers->peers_fe)->maxconn;
+-				curpeers->peers_fe->listen->backlog = ((struct proxy *)curpeers->peers_fe)->backlog;
+-				curpeers->peers_fe->listen->timeout = &((struct proxy *)curpeers->peers_fe)->timeout.client;
+-				curpeers->peers_fe->listen->accept = session_accept;
+-				curpeers->peers_fe->listen->frontend =  ((struct proxy *)curpeers->peers_fe);
+-				curpeers->peers_fe->listen->handler = process_session;
+-				curpeers->peers_fe->listen->analysers |=  ((struct proxy *)curpeers->peers_fe)->fe_req_ana;
+-				curpeers->peers_fe->listen->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
+-				global.maxsock += curpeers->peers_fe->listen->maxconn;
++
++				list_for_each_entry(l, &bind_conf->listeners, by_bind) {
++					l->maxconn = ((struct proxy *)curpeers->peers_fe)->maxconn;
++					l->backlog = ((struct proxy *)curpeers->peers_fe)->backlog;
++					l->timeout = &((struct proxy *)curpeers->peers_fe)->timeout.client;
++					l->accept = session_accept;
++					l->handler = process_session;
++					l->analysers |=  ((struct proxy *)curpeers->peers_fe)->fe_req_ana;
++					l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
++					global.maxsock += l->maxconn;
++				}
+ 			}
+ 		}
+ 	} /* neither "peer" nor "peers" */
+@@ -1446,19 +1455,16 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 		/* parse the listener address if any */
+ 		if ((curproxy->cap & PR_CAP_FE) && *args[2]) {
+-			struct listener *new, *last = curproxy->listen;
++			struct listener *l;
+ 
+-			if (!str2listener(args[2], curproxy, file, linenum)) {
++			bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[2]);
++
++			if (!str2listener(args[2], curproxy, bind_conf, file, linenum)) {
+ 				err_code |= ERR_FATAL;
+ 				goto out;
+ 			}
+ 
+-			bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[2]);
+-
+-			new = curproxy->listen;
+-			while (new != last) {
+-				new->bind_conf = bind_conf;
+-				new = new->next;
++			list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+ 				global.maxsock++;
+ 			}
+ 		}
+@@ -1671,7 +1677,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 	/* Now let's parse the proxy-specific keywords */
+ 	if (!strcmp(args[0], "bind")) {  /* new listen addresses */
+-		struct listener *new_listen, *last_listen;
++		struct listener *l;
+ 		int cur_arg;
+ 
+ 		if (curproxy == &defproxy) {
+@@ -1689,29 +1695,24 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 			goto out;
+ 		}
+ 
+-		last_listen = curproxy->listen;
+ 		bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[1]);
+ 
+ 		/* NOTE: the following line might create several listeners if there
+ 		 * are comma-separated IPs or port ranges. So all further processing
+ 		 * will have to be applied to all listeners created after last_listen.
+ 		 */
+-		if (!str2listener(args[1], curproxy, file, linenum)) {
++		if (!str2listener(args[1], curproxy, bind_conf, file, linenum)) {
+ 			err_code |= ERR_ALERT | ERR_FATAL;
+ 			goto out;
+ 		}
+ 
+-		new_listen = curproxy->listen;
+-		while (new_listen != last_listen) {
+-			new_listen->bind_conf = bind_conf;
+-			new_listen = new_listen->next;
++		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
++			/* Set default global rights and owner for unix bind  */
++			if (l->addr.ss_family == AF_UNIX)
++				memcpy(&(l->perm.ux), &(global.unix_bind.ux), sizeof(global.unix_bind.ux));
+ 			global.maxsock++;
+ 		}
+ 
+-		/* Set default global rights and owner for unix bind  */
+-		if (curproxy->listen->addr.ss_family == AF_UNIX) {
+-			memcpy(&(curproxy->listen->perm.ux), &(global.unix_bind.ux), sizeof(global.unix_bind.ux));
+-		}
+ 		cur_arg = 2;
+ 		while (*(args[cur_arg])) {
+ 			static int bind_dumped;
+@@ -1731,7 +1732,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 					goto out;
+ 				}
+ 
+-				code = kw->parse(args, cur_arg, curproxy, last_listen, &err);
++				code = kw->parse(args, cur_arg, curproxy, bind_conf, &err);
+ 				err_code |= code;
+ 
+ 				if (code) {
+@@ -4517,9 +4518,13 @@ stats_error_parsing:
+ 				 * the server either. We'll check if we have
+ 				 * a known port on the first listener.
+ 				 */
+-				struct listener *l = curproxy->listen;
+-				while (l && !(newsrv->check_port = get_host_port(&l->addr)))
+-					l = l->next;
++				struct listener *l;
++
++				list_for_each_entry(l, &curproxy->conf.listeners, by_fe) {
++					newsrv->check_port = get_host_port(&l->addr);
++					if (newsrv->check_port)
++						break;
++				}
+ 			}
+ 			if (!newsrv->check_port) {
+ 				Alert("parsing [%s:%d] : server %s has neither service port nor check port. Check has been disabled.\n",
+@@ -5683,7 +5688,7 @@ int check_config_validity()
+ 			break;
+ 		}
+ 
+-		if ((curproxy->cap & PR_CAP_FE) && (curproxy->listen == NULL))  {
++		if ((curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners))  {
+ 			Alert("config : %s '%s' has no listen address. Please either specify a valid address on the <listen> line, or use the <bind> keyword.\n",
+ 			      proxy_type_str(curproxy), curproxy->id);
+ 			cfgerr++;
+@@ -6495,20 +6500,6 @@ out_uri_auth_compat:
+ 				curproxy->be_req_ana |= AN_REQ_PRST_RDP_COOKIE;
+ 		}
+ 
+-		listener = NULL;
+-		while (curproxy->listen) {
+-			struct listener *next;
+-
+-			next = curproxy->listen->next;
+-			curproxy->listen->next = listener;
+-			listener = curproxy->listen;
+-
+-			if (!next)
+-				break;
+-
+-			curproxy->listen = next;
+-		}
+-
+ 		/* Configure SSL for each bind line.
+ 		 * Note: if configuration fails at some point, the ->ctx member
+ 		 * remains NULL so that listeners can later detach.
+@@ -6537,8 +6528,7 @@ out_uri_auth_compat:
+ 
+ 		/* adjust this proxy's listeners */
+ 		next_id = 1;
+-		listener = curproxy->listen;
+-		while (listener) {
++		list_for_each_entry(listener, &curproxy->conf.listeners, by_fe) {
+ 			if (!listener->luid) {
+ 				/* listener ID not set, use automatic numbering with first
+ 				 * spare entry starting with next_luid.
+@@ -6569,7 +6559,6 @@ out_uri_auth_compat:
+ 				listener->backlog = curproxy->backlog;
+ 			listener->timeout = &curproxy->timeout.client;
+ 			listener->accept = session_accept;
+-			listener->frontend = curproxy;
+ 			listener->handler = process_session;
+ 			listener->analysers |= curproxy->fe_req_ana;
+ 
+@@ -6584,9 +6573,6 @@ out_uri_auth_compat:
+ 			    ((curproxy->mode == PR_MODE_HTTP || listener->bind_conf->is_ssl) &&
+ 			     !(curproxy->no_options2 & PR_O2_SMARTACC)))
+ 				listener->options |= LI_O_NOQUICKACK;
+-
+-			/* We want the use_backend and default_backend rules to apply */
+-			listener = listener->next;
+ 		}
+ 
+ 		/* Release unused SSL configs */
+diff --git a/src/dumpstats.c b/src/dumpstats.c
+index ab4c416..5cd903b 100644
+--- a/src/dumpstats.c
++++ b/src/dumpstats.c
+@@ -181,6 +181,8 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+                               struct proxy *defpx, const char *file, int line,
+                               char **err)
+ {
++	struct bind_conf *bind_conf;
++
+ 	if (!strcmp(args[1], "socket")) {
+ 		struct sockaddr_un *su;
+ 		int cur_arg;
+@@ -209,6 +211,8 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+ 			}
+ 		}
+ 
++		bind_conf = bind_conf_alloc(&global.stats_fe->conf.bind, file, line, args[2]);
++
+ 		global.stats_sock.state = LI_INIT;
+ 		global.stats_sock.options = LI_O_UNLIMITED;
+ 		global.stats_sock.accept = session_accept;
+@@ -220,9 +224,9 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+ 		global.stats_sock.perm.ux.level = ACCESS_LVL_OPER; /* default access level */
+ 		global.stats_sock.maxconn = global.stats_fe->maxconn;
+ 		global.stats_sock.timeout = &global.stats_fe->timeout.client;
+-
+-		global.stats_sock.next  = global.stats_fe->listen;
+-		global.stats_fe->listen = &global.stats_sock;
++		global.stats_sock.bind_conf = bind_conf;
++		LIST_ADDQ(&global.stats_fe->conf.listeners, &global.stats_sock.by_fe);
++		LIST_ADDQ(&bind_conf->listeners, &global.stats_sock.by_bind);
+ 
+ 		cur_arg = 3;
+ 		while (*args[cur_arg]) {
+@@ -969,7 +973,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 						sv->counters.sps_max = 0;
+ 					}
+ 
+-				for (li = px->listen; li; li = li->next)
++				list_for_each_entry(li, &px->conf.listeners, by_bind)
+ 					if (li->counters) {
+ 						if (clrall)
+ 							memset(li->counters, 0, sizeof(*li->counters));
+@@ -1149,7 +1153,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 				 * its listeners. The blocked ones will be dequeued.
+ 				 */
+ 				px->maxconn = v;
+-				for (l = px->listen; l != NULL; l = l->next) {
++				list_for_each_entry(l, &px->conf.listeners, by_bind) {
+ 					l->maxconn = v;
+ 					if (l->state == LI_FULL)
+ 						resume_listener(l);
+@@ -2508,17 +2512,17 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
+ 				return 0;
+ 		}
+ 
+-		si->applet.ctx.stats.l = px->listen; /* may be NULL */
++		si->applet.ctx.stats.l = px->conf.listeners.n;
+ 		si->applet.ctx.stats.px_st = STAT_PX_ST_LI;
+ 		/* fall through */
+ 
+ 	case STAT_PX_ST_LI:
+ 		/* stats.l has been initialized above */
+-		for (; si->applet.ctx.stats.l != NULL; si->applet.ctx.stats.l = l->next) {
++		for (; si->applet.ctx.stats.l != &px->conf.listeners; si->applet.ctx.stats.l = l->by_fe.n) {
+ 			if (buffer_almost_full(&rep->buf))
+ 				return 0;
+ 
+-			l = si->applet.ctx.stats.l;
++			l = LIST_ELEM(si->applet.ctx.stats.l, struct listener *, by_fe);
+ 			if (!l->counters)
+ 				continue;
+ 
+diff --git a/src/haproxy.c b/src/haproxy.c
+index 05df3da..07c4f3f 100644
+--- a/src/haproxy.c
++++ b/src/haproxy.c
+@@ -605,7 +605,7 @@ void init(int argc, char **argv)
+ 				break;
+ 
+ 		for (px = proxy; px; px = px->next)
+-			if (px->state == PR_STNEW && px->listen)
++			if (px->state == PR_STNEW && !LIST_ISEMPTY(&px->conf.listeners))
+ 				break;
+ 
+ 		if (pr || px) {
+@@ -1032,21 +1032,17 @@ void deinit(void)
+ 			s = s_next;
+ 		}/* end while(s) */
+ 
+-		l = p->listen;
+-		while (l) {
+-			l_next = l->next;
++		list_for_each_entry_safe(l, l_next, &p->conf.listeners, by_fe) {
+ 			unbind_listener(l);
+ 			delete_listener(l);
+-			l->bind_conf = NULL;
++			LIST_DEL(&l->by_fe);
++			LIST_DEL(&l->by_bind);
+ 			free(l->name);
+ 			free(l->counters);
+ 			free(l);
+-			l = l_next;
+-		}/* end while(l) */
++		}
+ 
+-		bind_back = bind_conf = NULL;
+-		/* Release unused SSL configs.
+-		 */
++		/* Release unused SSL configs. */
+ 		list_for_each_entry_safe(bind_conf, bind_back, &p->conf.bind, by_fe) {
+ #ifdef USE_OPENSSL
+ 			ssl_sock_free_all_ctx(bind_conf);
+diff --git a/src/listener.c b/src/listener.c
+index 09a0257..802ddab 100644
+--- a/src/listener.c
++++ b/src/listener.c
+@@ -504,18 +504,18 @@ acl_fetch_so_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt
+ }
+ 
+ /* parse the "accept-proxy" bind keyword */
+-static int bind_parse_accept_proxy(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_accept_proxy(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 
+-	for (l = px->listen; l != last; l = l->next)
++	list_for_each_entry(l, &conf->listeners, by_bind)
+ 		l->options |= LI_O_ACC_PROXY;
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "backlog" bind keyword */
+-static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	int val;
+@@ -533,19 +533,19 @@ static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
++	list_for_each_entry(l, &conf->listeners, by_bind)
+ 		l->backlog = val;
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "id" bind keyword */
+-static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct eb32_node *node;
+-	struct listener *l;
++	struct listener *l, *new;
+ 
+-	if (px->listen->next != last) {
++	if (conf->listeners.n != conf->listeners.p) {
+ 		if (err)
+ 			memprintf(err, "'%s' can only be used with a single socket", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+@@ -557,16 +557,17 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct list
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	px->listen->luid = atol(args[cur_arg + 1]);
+-	px->listen->conf.id.key = px->listen->luid;
++	new = LIST_NEXT(&conf->listeners, struct listener *, by_bind);
++	new->luid = atol(args[cur_arg + 1]);
++	new->conf.id.key = new->luid;
+ 
+-	if (px->listen->luid <= 0) {
++	if (new->luid <= 0) {
+ 		if (err)
+ 			memprintf(err, "'%s' : custom id has to be > 0", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	node = eb32_lookup(&px->conf.used_listener_id, px->listen->luid);
++	node = eb32_lookup(&px->conf.used_listener_id, new->luid);
+ 	if (node) {
+ 		l = container_of(node, struct listener, conf.id);
+ 		if (err)
+@@ -576,12 +577,12 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct list
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	eb32_insert(&px->conf.used_listener_id, &px->listen->conf.id);
++	eb32_insert(&px->conf.used_listener_id, &new->conf.id);
+ 	return 0;
+ }
+ 
+ /* parse the "maxconn" bind keyword */
+-static int bind_parse_maxconn(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_maxconn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	int val;
+@@ -599,14 +600,14 @@ static int bind_parse_maxconn(char **args, int cur_arg, struct proxy *px, struct
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
++	list_for_each_entry(l, &conf->listeners, by_bind)
+ 		l->maxconn = val;
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "name" bind keyword */
+-static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 
+@@ -616,14 +617,14 @@ static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct li
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
++	list_for_each_entry(l, &conf->listeners, by_bind)
+ 		l->name = strdup(args[cur_arg + 1]);
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "nice" bind keyword */
+-static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	int val;
+@@ -641,7 +642,7 @@ static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct li
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
++	list_for_each_entry(l, &conf->listeners, by_bind)
+ 		l->nice = val;
+ 
+ 	return 0;
+diff --git a/src/peers.c b/src/peers.c
+index 09e45f7..62329dc 100644
+--- a/src/peers.c
++++ b/src/peers.c
+@@ -1104,7 +1104,7 @@ int peer_accept(struct session *s)
+  */
+ static struct session *peer_session_create(struct peer *peer, struct peer_session *ps)
+ {
+-	struct listener *l = ((struct proxy *)peer->peers->peers_fe)->listen;
++	struct listener *l = LIST_NEXT(&peer->peers->peers_fe->conf.listeners, struct listener *, by_fe);
+ 	struct proxy *p = (struct proxy *)l->frontend; /* attached frontend */
+ 	struct session *s;
+ 	struct http_txn *txn;
+@@ -1459,6 +1459,7 @@ void peers_register_table(struct peers *peers, struct stktable *table)
+ 	struct shared_table *st;
+ 	struct peer * curpeer;
+ 	struct peer_session *ps;
++	struct listener *listener;
+ 
+ 	st = (struct shared_table *)calloc(1,sizeof(struct shared_table));
+ 	st->table = table;
+@@ -1478,7 +1479,8 @@ void peers_register_table(struct peers *peers, struct stktable *table)
+ 		peers->peers_fe->maxconn += 3;
+ 	}
+ 
+-	peers->peers_fe->listen->maxconn = peers->peers_fe->maxconn;
++	list_for_each_entry(listener, &peers->peers_fe->conf.listeners, by_fe)
++		listener->maxconn = peers->peers_fe->maxconn;
+ 	st->sync_task = task_new();
+ 	st->sync_task->process = process_peer_sync;
+ 	st->sync_task->expire = TICK_ETERNITY;
+diff --git a/src/proto_tcp.c b/src/proto_tcp.c
+index 79e4d0d..c197245 100644
+--- a/src/proto_tcp.c
++++ b/src/proto_tcp.c
+@@ -1701,55 +1701,41 @@ static int val_payload_lv(struct arg *arg, char **err_msg)
+ 
+ #ifdef CONFIG_HAP_LINUX_TPROXY
+ /* parse the "transparent" bind keyword */
+-static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 
+-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
++			l->options |= LI_O_FOREIGN;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
+-		l->options |= LI_O_FOREIGN;
+-
+ 	return 0;
+ }
+ #endif
+ 
+ #ifdef TCP_DEFER_ACCEPT
+ /* parse the "defer-accept" bind keyword */
+-static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 
+-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
++			l->options |= LI_O_DEF_ACCEPT;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
+-		l->options |= LI_O_DEF_ACCEPT;
+-
+ 	return 0;
+ }
+ #endif
+ 
+ #ifdef TCP_MAXSEG
+ /* parse the "mss" bind keyword */
+-static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	int mss;
+ 
+-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
+-	}
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing MSS value", args[cur_arg]);
+@@ -1763,8 +1749,10 @@ static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct lis
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
+-		l->maxseg = mss;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
++			l->maxseg = mss;
++	}
+ 
+ 	return 0;
+ }
+@@ -1772,24 +1760,20 @@ static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct lis
+ 
+ #ifdef SO_BINDTODEVICE
+ /* parse the "mss" bind keyword */
+-static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 
+-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
+-	}
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing interface name", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
+-		l->interface = strdup(args[cur_arg + 1]);
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
++			l->interface = strdup(args[cur_arg + 1]);
++	}
+ 
+ 	global.last_checks |= LSTCHK_NETADM;
+ 	return 0;
+diff --git a/src/proto_uxst.c b/src/proto_uxst.c
+index 5f56ad5..58fd06d 100644
+--- a/src/proto_uxst.c
++++ b/src/proto_uxst.c
+@@ -349,17 +349,11 @@ static int uxst_unbind_listeners(struct protocol *proto)
+ }
+ 
+ /* parse the "mode" bind keyword */
+-static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	int val;
+ 
+-	if (px->listen->addr.ss_family != AF_UNIX) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
+-	}
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing mode (octal integer expected)", args[cur_arg]);
+@@ -368,24 +362,20 @@ static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct li
+ 
+ 	val = strtol(args[cur_arg + 1], NULL, 8);
+ 
+-	for (l = px->listen; l != last; l = l->next)
+-		l->perm.ux.mode = val;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_UNIX)
++			l->perm.ux.mode = val;
++	}
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "gid" bind keyword */
+-static int bind_parse_gid(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_gid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	int val;
+ 
+-	if (px->listen->addr.ss_family != AF_UNIX) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
+-	}
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing value", args[cur_arg]);
+@@ -393,24 +383,20 @@ static int bind_parse_gid(char **args, int cur_arg, struct proxy *px, struct lis
+ 	}
+ 
+ 	val = atol(args[cur_arg + 1]);
+-	for (l = px->listen; l != last; l = l->next)
+-		l->perm.ux.gid = val;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_UNIX)
++			l->perm.ux.gid = val;
++	}
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "group" bind keyword */
+-static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	struct group *group;
+ 
+-	if (px->listen->addr.ss_family != AF_UNIX) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
+-	}
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing group name", args[cur_arg]);
+@@ -424,24 +410,20 @@ static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct l
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
+-		l->perm.ux.gid = group->gr_gid;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_UNIX)
++			l->perm.ux.gid = group->gr_gid;
++	}
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "uid" bind keyword */
+-static int bind_parse_uid(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_uid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	int val;
+ 
+-	if (px->listen->addr.ss_family != AF_UNIX) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
+-	}
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing value", args[cur_arg]);
+@@ -449,24 +431,20 @@ static int bind_parse_uid(char **args, int cur_arg, struct proxy *px, struct lis
+ 	}
+ 
+ 	val = atol(args[cur_arg + 1]);
+-	for (l = px->listen; l != last; l = l->next)
+-		l->perm.ux.uid = val;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_UNIX)
++			l->perm.ux.uid = val;
++	}
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "user" bind keyword */
+-static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	struct listener *l;
+ 	struct passwd *user;
+ 
+-	if (px->listen->addr.ss_family != AF_UNIX) {
+-		if (err)
+-			memprintf(err, "'%s' option is only supported on unix sockets", args[cur_arg]);
+-		return ERR_ALERT | ERR_FATAL;
+-	}
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing user name", args[cur_arg]);
+@@ -480,8 +458,10 @@ static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct li
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	for (l = px->listen; l != last; l = l->next)
+-		l->perm.ux.uid = user->pw_uid;
++	list_for_each_entry(l, &conf->listeners, by_bind) {
++		if (l->addr.ss_family == AF_UNIX)
++			l->perm.ux.uid = user->pw_uid;
++	}
+ 
+ 	return 0;
+ }
+diff --git a/src/proxy.c b/src/proxy.c
+index 35e58b0..8db70b6 100644
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -446,6 +446,7 @@ void init_new_proxy(struct proxy *p)
+ 	LIST_INIT(&p->logformat);
+ 	LIST_INIT(&p->format_unique_id);
+ 	LIST_INIT(&p->conf.bind);
++	LIST_INIT(&p->conf.listeners);
+ 
+ 	/* Timeouts are defined as -1 */
+ 	proxy_reset_timeouts(p);
+@@ -475,7 +476,7 @@ int start_proxies(int verbose)
+ 			continue; /* already initialized */
+ 
+ 		pxerr = 0;
+-		for (listener = curproxy->listen; listener != NULL; listener = listener->next) {
++		list_for_each_entry(listener, &curproxy->conf.listeners, by_fe) {
+ 			if (listener->state != LI_ASSIGNED)
+ 				continue; /* already started */
+ 
+@@ -639,7 +640,7 @@ int pause_proxy(struct proxy *p)
+ 	Warning("Pausing %s %s.\n", proxy_cap_str(p->cap), p->id);
+ 	send_log(p, LOG_WARNING, "Pausing %s %s.\n", proxy_cap_str(p->cap), p->id);
+ 
+-	for (l = p->listen; l != NULL; l = l->next) {
++	list_for_each_entry(l, &p->conf.listeners, by_fe) {
+ 		if (!pause_listener(l))
+ 			p->state = PR_STERROR;
+ 	}
+@@ -666,7 +667,7 @@ void stop_proxy(struct proxy *p)
+ {
+ 	struct listener *l;
+ 
+-	for (l = p->listen; l != NULL; l = l->next) {
++	list_for_each_entry(l, &p->conf.listeners, by_fe) {
+ 		unbind_listener(l);
+ 		if (l->state >= LI_ASSIGNED) {
+ 			delete_listener(l);
+@@ -694,7 +695,7 @@ int resume_proxy(struct proxy *p)
+ 	send_log(p, LOG_WARNING, "Enabling %s %s.\n", proxy_cap_str(p->cap), p->id);
+ 
+ 	fail = 0;
+-	for (l = p->listen; l != NULL; l = l->next) {
++	list_for_each_entry(l, &p->conf.listeners, by_fe) {
+ 		if (!resume_listener(l)) {
+ 			int port;
+ 
+diff --git a/src/ssl_sock.c b/src/ssl_sock.c
+index 2d5e666..056a4e3 100644
+--- a/src/ssl_sock.c
++++ b/src/ssl_sock.c
+@@ -819,7 +819,7 @@ smp_fetch_ssl_sni(struct proxy *px, struct session *l4, void *l7, unsigned int o
+ }
+ 
+ /* parse the "ciphers" bind keyword */
+-static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+@@ -827,12 +827,12 @@ static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	px->listen->bind_conf->ciphers = strdup(args[cur_arg + 1]);
++	conf->ciphers = strdup(args[cur_arg + 1]);
+ 	return 0;
+ }
+ 
+ /* parse the "crt" bind keyword */
+-static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+@@ -840,37 +840,37 @@ static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct lis
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	if (ssl_sock_load_cert(args[cur_arg + 1], px->listen->bind_conf, px, err) > 0)
++	if (ssl_sock_load_cert(args[cur_arg + 1], conf, px, err) > 0)
+ 		return ERR_ALERT | ERR_FATAL;
+ 
+ 	return 0;
+ }
+ 
+ /* parse the "nosslv3" bind keyword */
+-static int bind_parse_nosslv3(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_nosslv3(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	px->listen->bind_conf->nosslv3 = 1;
++	conf->nosslv3 = 1;
+ 	return 0;
+ }
+ 
+ /* parse the "notlsv1" bind keyword */
+-static int bind_parse_notlsv1(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_notlsv1(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	px->listen->bind_conf->notlsv1 = 1;
++	conf->notlsv1 = 1;
+ 	return 0;
+ }
+ 
+ /* parse the "prefer-server-ciphers" bind keyword */
+-static int bind_parse_psc(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_psc(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	px->listen->bind_conf->prefer_server_ciphers = 1;
++	conf->prefer_server_ciphers = 1;
+ 	return 0;
+ }
+ 
+ /* parse the "ssl" bind keyword */
+-static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
++static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	px->listen->bind_conf->is_ssl = 1;
++	conf->is_ssl = 1;
+ 	return 0;
+ }
+ 
+-- 
+1.7.1
+

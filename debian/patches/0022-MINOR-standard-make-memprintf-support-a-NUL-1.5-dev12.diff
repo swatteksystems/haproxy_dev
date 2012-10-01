@@ -1,0 +1,790 @@
+From eb6cead1dee890ab205453a397a38499b50fc75c Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 20 Sep 2012 19:43:14 +0200
+Subject: MINOR: standard: make memprintf() support a NULL destination
+
+Doing so removes many checks that were systematically made because
+the callees don't know if the caller passed a valid pointer.
+---
+ include/common/standard.h |    3 +-
+ src/acl.c                 |   96 +++++++++++++++------------------------------
+ src/arg.c                 |   37 +++++++-----------
+ src/listener.c            |   37 ++++++-----------
+ src/proto_http.c          |    9 +---
+ src/proto_tcp.c           |   18 +++------
+ src/proto_uxst.c          |   21 +++-------
+ src/ssl_sock.c            |   31 ++++++---------
+ src/standard.c            |    6 ++-
+ 9 files changed, 94 insertions(+), 164 deletions(-)
+
+diff --git a/include/common/standard.h b/include/common/standard.h
+index 2d67faf..dbb219a 100644
+--- a/include/common/standard.h
++++ b/include/common/standard.h
+@@ -694,7 +694,8 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size);
+  * This means that <err> must be initialized to NULL before first invocation.
+  * The return value also holds the allocated string, which eases error checking
+  * and immediate consumption. If the output pointer is not used, NULL must be
+- * passed instead and it will be ignored.
++ * passed instead and it will be ignored. The returned message will then also
++ * be NULL so that the caller does not have to bother with freeing anything.
+  *
+  * It is also convenient to use it without any free except the last one :
+  *    err = NULL;
+diff --git a/src/acl.c b/src/acl.c
+index d8e35b2..883986c 100644
+--- a/src/acl.c
++++ b/src/acl.c
+@@ -804,8 +804,7 @@ int acl_parse_str(const char **text, struct acl_pattern *pattern, int *opaque, c
+ 
+ 		node = calloc(1, sizeof(*node) + len + 1);
+ 		if (!node) {
+-			if (err)
+-				memprintf(err, "out of memory while loading string pattern");
++			memprintf(err, "out of memory while loading string pattern");
+ 			return 0;
+ 		}
+ 		memcpy(node->key, *text, len + 1);
+@@ -817,8 +816,7 @@ int acl_parse_str(const char **text, struct acl_pattern *pattern, int *opaque, c
+ 
+ 	pattern->ptr.str = strdup(*text);
+ 	if (!pattern->ptr.str) {
+-		if (err)
+-			memprintf(err, "out of memory while loading string pattern");
++		memprintf(err, "out of memory while loading string pattern");
+ 		return 0;
+ 	}
+ 	pattern->len = len;
+@@ -839,8 +837,7 @@ acl_parse_strcat(const char **text, struct acl_pattern *pattern, int *opaque, ch
+ 	pattern->type = SMP_T_CSTR;
+ 	pattern->ptr.str = s = calloc(1, len);
+ 	if (!pattern->ptr.str) {
+-		if (err)
+-			memprintf(err, "out of memory while loading pattern");
++		memprintf(err, "out of memory while loading pattern");
+ 		return 0;
+ 	}
+ 
+@@ -867,16 +864,14 @@ int acl_parse_reg(const char **text, struct acl_pattern *pattern, int *opaque, c
+ 	preg = calloc(1, sizeof(regex_t));
+ 
+ 	if (!preg) {
+-		if (err)
+-			memprintf(err, "out of memory while loading pattern");
++		memprintf(err, "out of memory while loading pattern");
+ 		return 0;
+ 	}
+ 
+ 	icase = (pattern->flags & ACL_PAT_F_IGNORE_CASE) ? REG_ICASE : 0;
+ 	if (regcomp(preg, *text, REG_EXTENDED | REG_NOSUB | icase) != 0) {
+ 		free(preg);
+-		if (err)
+-			memprintf(err, "regex '%s' is invalid", *text);
++		memprintf(err, "regex '%s' is invalid", *text);
+ 		return 0;
+ 	}
+ 
+@@ -914,8 +909,7 @@ int acl_parse_int(const char **text, struct acl_pattern *pattern, int *opaque, c
+ 		case STD_OP_LT: *opaque = 3; break;
+ 		case STD_OP_LE: *opaque = 4; break;
+ 		default:
+-			if (err)
+-				memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
++			memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
+ 			return 0;
+ 		}
+ 
+@@ -942,8 +936,7 @@ int acl_parse_int(const char **text, struct acl_pattern *pattern, int *opaque, c
+ 
+ 	if (last && *opaque >= 1 && *opaque <= 4) {
+ 		/* having a range with a min or a max is absurd */
+-		if (err)
+-			memprintf(err, "integer range '%s' specified with a comparison operator", text[skip]);
++		memprintf(err, "integer range '%s' specified with a comparison operator", text[skip]);
+ 		return 0;
+ 	}
+ 
+@@ -1007,8 +1000,7 @@ int acl_parse_dotted_ver(const char **text, struct acl_pattern *pattern, int *op
+ 		case STD_OP_LT: *opaque = 3; break;
+ 		case STD_OP_LE: *opaque = 4; break;
+ 		default:
+-			if (err)
+-				memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
++			memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
+ 			return 0;
+ 		}
+ 
+@@ -1048,8 +1040,7 @@ int acl_parse_dotted_ver(const char **text, struct acl_pattern *pattern, int *op
+ 
+ 	if (last && *opaque >= 1 && *opaque <= 4) {
+ 		/* having a range with a min or a max is absurd */
+-		if (err)
+-			memprintf(err, "version range '%s' specified with a comparison operator", text[skip]);
++		memprintf(err, "version range '%s' specified with a comparison operator", text[skip]);
+ 		return 0;
+ 	}
+ 
+@@ -1103,8 +1094,7 @@ int acl_parse_ip(const char **text, struct acl_pattern *pattern, int *opaque, ch
+ 			/* FIXME: insert <addr>/<mask> into the tree here */
+ 			node = calloc(1, sizeof(*node) + 4); /* reserve 4 bytes for IPv4 address */
+ 			if (!node) {
+-				if (err)
+-					memprintf(err, "out of memory while loading IPv4 pattern");
++				memprintf(err, "out of memory while loading IPv4 pattern");
+ 				return 0;
+ 			}
+ 			memcpy(node->key, &pattern->val.ipv4.addr, 4); /* network byte order */
+@@ -1122,8 +1112,7 @@ int acl_parse_ip(const char **text, struct acl_pattern *pattern, int *opaque, ch
+ 		return 1;
+ 	}
+ 	else {
+-		if (err)
+-			memprintf(err, "'%s' is not a valid IPv4 or IPv6 address", *text);
++		memprintf(err, "'%s' is not a valid IPv4 or IPv6 address", *text);
+ 		return 0;
+ 	}
+ }
+@@ -1349,15 +1338,13 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
+ 
+ 	aclkw = find_acl_kw(args[0]);
+ 	if (!aclkw || !aclkw->parse) {
+-		if (err)
+-			memprintf(err, "unknown ACL keyword '%s'", *args);
++		memprintf(err, "unknown ACL keyword '%s'", *args);
+ 		goto out_return;
+ 	}
+ 
+ 	expr = (struct acl_expr *)calloc(1, sizeof(*expr));
+ 	if (!expr) {
+-		if (err)
+-			memprintf(err, "out of memory when parsing ACL expression");
++		memprintf(err, "out of memory when parsing ACL expression");
+ 		goto out_return;
+ 	}
+ 
+@@ -1376,8 +1363,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
+ 			arg++;
+ 			end = strchr(arg, ')');
+ 			if (!end) {
+-				if (err)
+-					memprintf(err, "missing closing ')' after arguments to ACL keyword '%s'", aclkw->kw);
++				memprintf(err, "missing closing ')' after arguments to ACL keyword '%s'", aclkw->kw);
+ 				goto out_free_expr;
+ 			}
+ 
+@@ -1390,8 +1376,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
+ 					       err, NULL, NULL);
+ 			if (nbargs < 0) {
+ 				/* note that make_arg_list will have set <err> here */
+-				if (err)
+-					memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
++				memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
+ 				goto out_free_expr;
+ 			}
+ 
+@@ -1399,8 +1384,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
+ 				/* invalid keyword argument, error must have been
+ 				 * set by val_args().
+ 				 */
+-				if (err)
+-					memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
++				memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
+ 				goto out_free_expr;
+ 			}
+ 		}
+@@ -1412,8 +1396,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
+ 			 * the current one later.
+ 			 */
+ 			if (type != ARGT_FE && type != ARGT_BE && type != ARGT_TAB) {
+-				if (err)
+-					memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
++				memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
+ 				goto out_free_expr;
+ 			}
+ 
+@@ -1430,16 +1413,14 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
+ 		}
+ 		else if (ARGM(aclkw->arg_mask)) {
+ 			/* there were some mandatory arguments */
+-			if (err)
+-				memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
++			memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
+ 			goto out_free_expr;
+ 		}
+ 	}
+ 	else {
+ 		if (arg) {
+ 			/* no argument expected */
+-			if (err)
+-				memprintf(err, "ACL keyword '%s' takes no argument", aclkw->kw);
++			memprintf(err, "ACL keyword '%s' takes no argument", aclkw->kw);
+ 			goto out_free_expr;
+ 		}
+ 	}
+@@ -1475,8 +1456,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
+ 		int ret;
+ 		pattern = (struct acl_pattern *)calloc(1, sizeof(*pattern));
+ 		if (!pattern) {
+-			if (err)
+-				memprintf(err, "out of memory when parsing ACL pattern");
++			memprintf(err, "out of memory when parsing ACL pattern");
+ 			goto out_free_expr;
+ 		}
+ 		pattern->flags = patflags;
+@@ -1535,8 +1515,7 @@ struct acl *parse_acl(const char **args, struct list *known_acl, char **err)
+ 	const char *pos;
+ 
+ 	if (**args && (pos = invalid_char(*args))) {
+-		if (err)
+-			memprintf(err, "invalid character in ACL name : '%c'", *pos);
++		memprintf(err, "invalid character in ACL name : '%c'", *pos);
+ 		goto out_return;
+ 	}
+ 
+@@ -1566,14 +1545,12 @@ struct acl *parse_acl(const char **args, struct list *known_acl, char **err)
+ 	if (!cur_acl) {
+ 		name = strdup(args[0]);
+ 		if (!name) {
+-			if (err)
+-				memprintf(err, "out of memory when parsing ACL");
++			memprintf(err, "out of memory when parsing ACL");
+ 			goto out_free_acl_expr;
+ 		}
+ 		cur_acl = (struct acl *)calloc(1, sizeof(*cur_acl));
+ 		if (cur_acl == NULL) {
+-			if (err)
+-				memprintf(err, "out of memory when parsing ACL");
++			memprintf(err, "out of memory when parsing ACL");
+ 			goto out_free_name;
+ 		}
+ 
+@@ -1644,8 +1621,7 @@ struct acl *find_acl_default(const char *acl_name, struct list *known_acl, char
+ 	}
+ 
+ 	if (default_acl_list[index].name == NULL) {
+-		if (err)
+-			memprintf(err, "no such ACL : '%s'", acl_name);
++		memprintf(err, "no such ACL : '%s'", acl_name);
+ 		return NULL;
+ 	}
+ 
+@@ -1657,15 +1633,13 @@ struct acl *find_acl_default(const char *acl_name, struct list *known_acl, char
+ 
+ 	name = strdup(acl_name);
+ 	if (!name) {
+-		if (err)
+-			memprintf(err, "out of memory when building default ACL '%s'", acl_name);
++		memprintf(err, "out of memory when building default ACL '%s'", acl_name);
+ 		goto out_free_acl_expr;
+ 	}
+ 
+ 	cur_acl = (struct acl *)calloc(1, sizeof(*cur_acl));
+ 	if (cur_acl == NULL) {
+-		if (err)
+-			memprintf(err, "out of memory when building default ACL '%s'", acl_name);
++		memprintf(err, "out of memory when building default ACL '%s'", acl_name);
+ 		goto out_free_name;
+ 	}
+ 
+@@ -1721,8 +1695,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
+ 
+ 	cond = (struct acl_cond *)calloc(1, sizeof(*cond));
+ 	if (cond == NULL) {
+-		if (err)
+-			memprintf(err, "out of memory when parsing condition");
++		memprintf(err, "out of memory when parsing condition");
+ 		goto out_return;
+ 	}
+ 
+@@ -1765,15 +1738,13 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
+ 				arg_end++;
+ 
+ 			if (!*args[arg_end]) {
+-				if (err)
+-					memprintf(err, "missing closing '}' in condition");
++				memprintf(err, "missing closing '}' in condition");
+ 				goto out_free_suite;
+ 			}
+ 
+ 			args_new = calloc(1, (arg_end - arg + 1) * sizeof(*args_new));
+ 			if (!args_new) {
+-				if (err)
+-					memprintf(err, "out of memory when parsing condition");
++				memprintf(err, "out of memory when parsing condition");
+ 				goto out_free_suite;
+ 			}
+ 
+@@ -1807,8 +1778,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
+ 
+ 		cur_term = (struct acl_term *)calloc(1, sizeof(*cur_term));
+ 		if (cur_term == NULL) {
+-			if (err)
+-				memprintf(err, "out of memory when parsing condition");
++			memprintf(err, "out of memory when parsing condition");
+ 			goto out_free_suite;
+ 		}
+ 
+@@ -1819,8 +1789,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
+ 		if (!cur_suite) {
+ 			cur_suite = (struct acl_term_suite *)calloc(1, sizeof(*cur_suite));
+ 			if (cur_term == NULL) {
+-				if (err)
+-					memprintf(err, "out of memory when parsing condition");
++				memprintf(err, "out of memory when parsing condition");
+ 				goto out_free_term;
+ 			}
+ 			LIST_INIT(&cur_suite->terms);
+@@ -1867,8 +1836,7 @@ struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, co
+ 		args++;
+ 	}
+ 	else {
+-		if (err)
+-			memprintf(err, "conditions must start with either 'if' or 'unless'");
++		memprintf(err, "conditions must start with either 'if' or 'unless'");
+ 		return NULL;
+ 	}
+ 
+diff --git a/src/arg.c b/src/arg.c
+index 9d5fcee..187540d 100644
+--- a/src/arg.c
++++ b/src/arg.c
+@@ -215,22 +215,19 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
+ 
+ 	if (pos < min_arg) {
+ 		/* not enough arguments */
+-		if (err_msg)
+-			memprintf(err_msg,
+-				  "Missing arguments (got %d/%d), type '%s' expected",
+-				  pos, min_arg, arg_type_names[(mask >> (pos * 4)) & 15]);
++		memprintf(err_msg,
++		          "Missing arguments (got %d/%d), type '%s' expected",
++		          pos, min_arg, arg_type_names[(mask >> (pos * 4)) & 15]);
+ 		goto err;
+ 	}
+ 
+ 	if (len) {
+ 		/* too many arguments, starting at <in> */
+-		if (err_msg) {
+-			/* the caller is responsible for freeing this message */
+-			word = my_strndup(in, len);
+-			memprintf(err_msg, "end of arguments expected at position %d, but got '%s'",
+-				  pos + 1, word);
+-			free(word); word = NULL;
+-		}
++		/* the caller is responsible for freeing this message */
++		word = my_strndup(in, len);
++		memprintf(err_msg, "end of arguments expected at position %d, but got '%s'",
++		          pos + 1, word);
++		free(word); word = NULL;
+ 		goto err;
+ 	}
+ 
+@@ -255,23 +252,17 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
+ 	return -1;
+ 
+  empty_err:
+-	if (err_msg) {
+-		memprintf(err_msg, "expected type '%s' at position %d, but got nothing",
+-			  arg_type_names[(mask >> (pos * 4)) & 15], pos + 1);
+-	}
++	memprintf(err_msg, "expected type '%s' at position %d, but got nothing",
++	          arg_type_names[(mask >> (pos * 4)) & 15], pos + 1);
+ 	goto err;
+ 
+  parse_err:
+-	if (err_msg) {
+-		memprintf(err_msg, "failed to parse '%s' as type '%s' at position %d",
+-			  word, arg_type_names[(mask >> (pos * 4)) & 15], pos + 1);
+-	}
++	memprintf(err_msg, "failed to parse '%s' as type '%s' at position %d",
++	          word, arg_type_names[(mask >> (pos * 4)) & 15], pos + 1);
+ 	goto err;
+ 
+  not_impl:
+-	if (err_msg) {
+-		memprintf(err_msg, "parsing for type '%s' was not implemented, please report this bug",
+-			  arg_type_names[(mask >> (pos * 4)) & 15]);
+-	}
++	memprintf(err_msg, "parsing for type '%s' was not implemented, please report this bug",
++	          arg_type_names[(mask >> (pos * 4)) & 15]);
+ 	goto err;
+ }
+diff --git a/src/listener.c b/src/listener.c
+index 802ddab..d704b42 100644
+--- a/src/listener.c
++++ b/src/listener.c
+@@ -521,15 +521,13 @@ static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct
+ 	int val;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing value", args[cur_arg]);
++		memprintf(err, "'%s' : missing value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	val = atol(args[cur_arg + 1]);
+ 	if (val <= 0) {
+-		if (err)
+-			memprintf(err, "'%s' : invalid value %d, must be > 0", args[cur_arg], val);
++		memprintf(err, "'%s' : invalid value %d, must be > 0", args[cur_arg], val);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -546,14 +544,12 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
+ 	struct listener *l, *new;
+ 
+ 	if (conf->listeners.n != conf->listeners.p) {
+-		if (err)
+-			memprintf(err, "'%s' can only be used with a single socket", args[cur_arg]);
++		memprintf(err, "'%s' can only be used with a single socket", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : expects an integer argument", args[cur_arg]);
++		memprintf(err, "'%s' : expects an integer argument", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -562,18 +558,16 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
+ 	new->conf.id.key = new->luid;
+ 
+ 	if (new->luid <= 0) {
+-		if (err)
+-			memprintf(err, "'%s' : custom id has to be > 0", args[cur_arg]);
++		memprintf(err, "'%s' : custom id has to be > 0", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	node = eb32_lookup(&px->conf.used_listener_id, new->luid);
+ 	if (node) {
+ 		l = container_of(node, struct listener, conf.id);
+-		if (err)
+-			memprintf(err, "'%s' : custom id %d already used at %s:%d ('bind %s')",
+-			          args[cur_arg], l->luid, l->bind_conf->file, l->bind_conf->line,
+-			          l->bind_conf->arg);
++		memprintf(err, "'%s' : custom id %d already used at %s:%d ('bind %s')",
++		          args[cur_arg], l->luid, l->bind_conf->file, l->bind_conf->line,
++		          l->bind_conf->arg);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -588,15 +582,13 @@ static int bind_parse_maxconn(char **args, int cur_arg, struct proxy *px, struct
+ 	int val;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing value", args[cur_arg]);
++		memprintf(err, "'%s' : missing value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	val = atol(args[cur_arg + 1]);
+ 	if (val <= 0) {
+-		if (err)
+-			memprintf(err, "'%s' : invalid value %d, must be > 0", args[cur_arg], val);
++		memprintf(err, "'%s' : invalid value %d, must be > 0", args[cur_arg], val);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -612,8 +604,7 @@ static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct bi
+ 	struct listener *l;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing name", args[cur_arg]);
++		memprintf(err, "'%s' : missing name", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -630,15 +621,13 @@ static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct bi
+ 	int val;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing value", args[cur_arg]);
++		memprintf(err, "'%s' : missing value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	val = atol(args[cur_arg + 1]);
+ 	if (val < -1024 || val > 1024) {
+-		if (err)
+-			memprintf(err, "'%s' : invalid value %d, allowed range is -1024..1024", args[cur_arg], val);
++		memprintf(err, "'%s' : invalid value %d, allowed range is -1024..1024", args[cur_arg], val);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+diff --git a/src/proto_http.c b/src/proto_http.c
+index a2030f6..8a43e8b 100644
+--- a/src/proto_http.c
++++ b/src/proto_http.c
+@@ -7743,8 +7743,7 @@ static int acl_parse_meth(const char **text, struct acl_pattern *pattern, int *o
+ 	if (meth == HTTP_METH_OTHER) {
+ 		pattern->ptr.str = strdup(*text);
+ 		if (!pattern->ptr.str) {
+-			if (err)
+-				memprintf(err, "out of memory while loading pattern");
++			memprintf(err, "out of memory while loading pattern");
+ 			return 0;
+ 		}
+ 		pattern->len = len;
+@@ -7819,8 +7818,7 @@ static int acl_parse_ver(const char **text, struct acl_pattern *pattern, int *op
+ {
+ 	pattern->ptr.str = strdup(*text);
+ 	if (!pattern->ptr.str) {
+-		if (err)
+-			memprintf(err, "out of memory while loading pattern");
++		memprintf(err, "out of memory while loading pattern");
+ 		return 0;
+ 	}
+ 	pattern->len = strlen(*text);
+@@ -8643,8 +8641,7 @@ smp_fetch_url_param_val(struct proxy *px, struct session *l4, void *l7, unsigned
+ static int val_hdr(struct arg *arg, char **err_msg)
+ {
+ 	if (arg && arg[1].type == ARGT_SINT && arg[1].data.sint < -MAX_HDR_HISTORY) {
+-		if (err_msg)
+-			memprintf(err_msg, "header occurrence must be >= %d", -MAX_HDR_HISTORY);
++		memprintf(err_msg, "header occurrence must be >= %d", -MAX_HDR_HISTORY);
+ 		return 0;
+ 	}
+ 	return 1;
+diff --git a/src/proto_tcp.c b/src/proto_tcp.c
+index c197245..1e97e8e 100644
+--- a/src/proto_tcp.c
++++ b/src/proto_tcp.c
+@@ -1666,8 +1666,7 @@ smp_fetch_payload(struct proxy *px, struct session *l4, void *l7, unsigned int o
+ static int val_payload(struct arg *arg, char **err_msg)
+ {
+ 	if (!arg[1].data.uint) {
+-		if (err_msg)
+-			memprintf(err_msg, "payload length must be > 0");
++		memprintf(err_msg, "payload length must be > 0");
+ 		return 0;
+ 	}
+ 	return 1;
+@@ -1685,15 +1684,13 @@ static int val_payload(struct arg *arg, char **err_msg)
+ static int val_payload_lv(struct arg *arg, char **err_msg)
+ {
+ 	if (!arg[1].data.uint) {
+-		if (err_msg)
+-			memprintf(err_msg, "payload length must be > 0");
++		memprintf(err_msg, "payload length must be > 0");
+ 		return 0;
+ 	}
+ 
+ 	if (arg[2].type == ARGT_SINT &&
+ 	    (int)(arg[0].data.uint + arg[1].data.uint + arg[2].data.sint) < 0) {
+-		if (err_msg)
+-			memprintf(err_msg, "payload offset too negative");
++		memprintf(err_msg, "payload offset too negative");
+ 		return 0;
+ 	}
+ 	return 1;
+@@ -1737,15 +1734,13 @@ static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct bin
+ 	int mss;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing MSS value", args[cur_arg]);
++		memprintf(err, "'%s' : missing MSS value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	mss = atoi(args[cur_arg + 1]);
+ 	if (!mss || abs(mss) > 65535) {
+-		if (err)
+-			memprintf(err, "'%s' : expects an MSS with and absolute value between 1 and 65535", args[cur_arg]);
++		memprintf(err, "'%s' : expects an MSS with and absolute value between 1 and 65535", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -1765,8 +1760,7 @@ static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, stru
+ 	struct listener *l;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing interface name", args[cur_arg]);
++		memprintf(err, "'%s' : missing interface name", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+diff --git a/src/proto_uxst.c b/src/proto_uxst.c
+index 3757236..3f18770 100644
+--- a/src/proto_uxst.c
++++ b/src/proto_uxst.c
+@@ -352,8 +352,7 @@ static int uxst_unbind_listeners(struct protocol *proto)
+ static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing mode (octal integer expected)", args[cur_arg]);
++		memprintf(err, "'%s' : missing mode (octal integer expected)", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -365,8 +364,7 @@ static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct bi
+ static int bind_parse_gid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing value", args[cur_arg]);
++		memprintf(err, "'%s' : missing value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -380,15 +378,13 @@ static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct b
+ 	struct group *group;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing group name", args[cur_arg]);
++		memprintf(err, "'%s' : missing group name", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	group = getgrnam(args[cur_arg + 1]);
+ 	if (!group) {
+-		if (err)
+-			memprintf(err, "'%s' : unknown group name '%s'", args[cur_arg], args[cur_arg + 1]);
++		memprintf(err, "'%s' : unknown group name '%s'", args[cur_arg], args[cur_arg + 1]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -400,8 +396,7 @@ static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct b
+ static int bind_parse_uid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing value", args[cur_arg]);
++		memprintf(err, "'%s' : missing value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -415,15 +410,13 @@ static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct bi
+ 	struct passwd *user;
+ 
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing user name", args[cur_arg]);
++		memprintf(err, "'%s' : missing user name", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+ 	user = getpwnam(args[cur_arg + 1]);
+ 	if (!user) {
+-		if (err)
+-			memprintf(err, "'%s' : unknown user name '%s'", args[cur_arg], args[cur_arg + 1]);
++		memprintf(err, "'%s' : unknown user name '%s'", args[cur_arg], args[cur_arg + 1]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+diff --git a/src/ssl_sock.c b/src/ssl_sock.c
+index 056a4e3..3c997eb 100644
+--- a/src/ssl_sock.c
++++ b/src/ssl_sock.c
+@@ -264,25 +264,22 @@ static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf
+ 
+ 	ctx = SSL_CTX_new(SSLv23_server_method());
+ 	if (!ctx) {
+-		if (err)
+-			memprintf(err, "%sunable to allocate SSL context for cert '%s'.\n",
+-				  *err ? *err : "", path);
++		memprintf(err, "%sunable to allocate SSL context for cert '%s'.\n",
++		          err && *err ? *err : "", path);
+ 		return 1;
+ 	}
+ 
+ 	if (SSL_CTX_use_PrivateKey_file(ctx, path, SSL_FILETYPE_PEM) <= 0) {
+-		if (err)
+-			memprintf(err, "%sunable to load SSL private key from PEM file '%s'.\n",
+-				  *err ? *err : "", path);
++		memprintf(err, "%sunable to load SSL private key from PEM file '%s'.\n",
++		          err && *err ? *err : "", path);
+ 		SSL_CTX_free(ctx);
+ 		return 1;
+ 	}
+ 
+ 	ret = ssl_sock_load_cert_chain_file(ctx, path, bind_conf);
+ 	if (ret <= 0) {
+-		if (err)
+-			memprintf(err, "%sunable to load SSL certificate from PEM file '%s'.\n",
+-				  *err ? *err : "", path);
++		memprintf(err, "%sunable to load SSL certificate from PEM file '%s'.\n",
++		          err && *err ? *err : "", path);
+ 		if (ret < 0) /* serious error, must do that ourselves */
+ 			SSL_CTX_free(ctx);
+ 		return 1;
+@@ -292,9 +289,8 @@ static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf
+ 	 */
+ #ifndef SSL_CTRL_SET_TLSEXT_HOSTNAME
+ 	if (bind_conf->default_ctx) {
+-		if (err)
+-			memprintf(err, "%sthis version of openssl cannot load multiple SSL certificates.\n",
+-				  *err ? *err : "");
++		memprintf(err, "%sthis version of openssl cannot load multiple SSL certificates.\n",
++		          err && *err ? *err : "");
+ 		return 1;
+ 	}
+ #endif
+@@ -327,9 +323,8 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, struct proxy *cu
+ 	while ((de = readdir(dir))) {
+ 		snprintf(fp, pathlen + 1 + NAME_MAX + 1, "%s/%s", path, de->d_name);
+ 		if (stat(fp, &buf) != 0) {
+-			if (err)
+-				memprintf(err, "%sunable to stat SSL certificate from file '%s' : %s.\n",
+-					  *err ? *err : "", fp, strerror(errno));
++			memprintf(err, "%sunable to stat SSL certificate from file '%s' : %s.\n",
++			          err && *err ? *err : "", fp, strerror(errno));
+ 			cfgerr++;
+ 			continue;
+ 		}
+@@ -822,8 +817,7 @@ smp_fetch_ssl_sni(struct proxy *px, struct session *l4, void *l7, unsigned int o
+ static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing cipher suite", args[cur_arg]);
++		memprintf(err, "'%s' : missing cipher suite", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+@@ -835,8 +829,7 @@ static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct
+ static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+ 	if (!*args[cur_arg + 1]) {
+-		if (err)
+-			memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
++		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+diff --git a/src/standard.c b/src/standard.c
+index 31f4ddd..49810fc 100644
+--- a/src/standard.c
++++ b/src/standard.c
+@@ -1788,7 +1788,8 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size)
+  * This means that <err> must be initialized to NULL before first invocation.
+  * The return value also holds the allocated string, which eases error checking
+  * and immediate consumption. If the output pointer is not used, NULL must be
+- * passed instead and it will be ignored.
++ * passed instead and it will be ignored. The returned message will then also
++ * be NULL so that the caller does not have to bother with freeing anything.
+  *
+  * It is also convenient to use it without any free except the last one :
+  *    err = NULL;
+@@ -1804,6 +1805,9 @@ char *memprintf(char **out, const char *format, ...)
+ 	int allocated = 0;
+ 	int needed = 0;
+ 
++	if (!out)
++		return NULL;
++
+ 	do {
+ 		/* vsnprintf() will return the required length even when the
+ 		 * target buffer is NULL. We do this in a loop just in case
+-- 
+1.7.1
+

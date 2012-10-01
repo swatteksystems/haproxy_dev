@@ -1,0 +1,76 @@
+From dda5e7c986b12e3e0acf471faa818da03c7ed239 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Mon, 24 Sep 2012 17:15:42 +0200
+Subject: CLEANUP: connection: offer conn_prepare() to set up a connection
+
+This will be used by checks as well as stream interfaces.
+---
+ include/proto/connection.h       |   12 ++++++++++++
+ include/proto/stream_interface.h |   18 +++---------------
+ 2 files changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/include/proto/connection.h b/include/proto/connection.h
+index 32e77cf..94f1c83 100644
+--- a/include/proto/connection.h
++++ b/include/proto/connection.h
+@@ -412,6 +412,18 @@ static inline void conn_get_to_addr(struct connection *conn)
+ 	conn->flags |= CO_FL_ADDR_TO_SET;
+ }
+ 
++/* prepares a connection with the appropriate app_cb, ctrl and data layers. The
++ * data state and context are set to 0.
++ */
++static inline void conn_prepare(struct connection *conn, const struct app_cb *app,
++                                const struct protocol *ctrl, const struct data_ops *data)
++{
++	conn->app_cb = app;
++	conn->ctrl = ctrl;
++	conn->data = data;
++	conn->data_st = 0;
++	conn->data_ctx = NULL;
++}
+ 
+ #endif /* _PROTO_CONNECTION_H */
+ 
+diff --git a/include/proto/stream_interface.h b/include/proto/stream_interface.h
+index 05a3210..f68b6ba 100644
+--- a/include/proto/stream_interface.h
++++ b/include/proto/stream_interface.h
+@@ -67,31 +67,19 @@ static inline int si_fd(struct stream_interface *si)
+ static inline void si_prepare_conn(struct stream_interface *si, const struct protocol *ctrl, const struct data_ops *ops)
+ {
+ 	si->ops = &si_conn_ops;
+-	si->conn.app_cb = &si_conn_cb;
+-	si->conn.ctrl = ctrl;
+-	si->conn.data = ops;
+-	si->conn.data_st = 0;
+-	si->conn.data_ctx = NULL;
++	conn_prepare(&si->conn, &si_conn_cb, ctrl, ops);
+ }
+ 
+ static inline void si_prepare_embedded(struct stream_interface *si)
+ {
+ 	si->ops = &si_embedded_ops;
+-	si->conn.app_cb = NULL;
+-	si->conn.ctrl = NULL;
+-	si->conn.data = NULL;
+-	si->conn.data_st = 0;
+-	si->conn.data_ctx = NULL;
++	conn_prepare(&si->conn, NULL, NULL, NULL);
+ }
+ 
+ static inline void si_prepare_task(struct stream_interface *si)
+ {
+ 	si->ops = &si_task_ops;
+-	si->conn.app_cb = NULL;
+-	si->conn.ctrl = NULL;
+-	si->conn.data = NULL;
+-	si->conn.data_st = 0;
+-	si->conn.data_ctx = NULL;
++	conn_prepare(&si->conn, NULL, NULL, NULL);
+ }
+ 
+ /* Sends a shutr to the connection using the data layer */
+-- 
+1.7.1
+

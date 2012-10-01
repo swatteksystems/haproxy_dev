@@ -1,0 +1,417 @@
+From 290e63aa87e91a0ebb404f7783d4aae8a7df7cfb Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Thu, 20 Sep 2012 18:07:14 +0200
+Subject: REORG: listener: move unix perms from the listener to the bind_conf
+
+Unix permissions are per-bind configuration line and not per listener,
+so let's concretize this in the way the config is stored. This avoids
+some unneeded loops to set permissions on all listeners.
+
+The access level is not part of the unix perms so it has been moved
+away. Once we can use str2listener() to set all listener addresses,
+we'll have a bind keyword parser for this one.
+---
+ include/proto/listener.h |    5 ++++
+ include/types/listener.h |   14 +++++-------
+ src/cfgparse.c           |    5 +---
+ src/dumpstats.c          |   42 +++++++++++++++++++-------------------
+ src/haproxy.c            |    9 --------
+ src/proto_uxst.c         |   51 +++++++--------------------------------------
+ 6 files changed, 41 insertions(+), 85 deletions(-)
+
+diff --git a/include/proto/listener.h b/include/proto/listener.h
+index d7b21d5..63bef12 100644
+--- a/include/proto/listener.h
++++ b/include/proto/listener.h
+@@ -131,6 +131,11 @@ static inline struct bind_conf *bind_conf_alloc(struct list *lh, const char *fil
+ 		LIST_ADDQ(lh, &bind_conf->by_fe);
+ 	if (arg)
+ 		bind_conf->arg = strdup(arg);
++
++	bind_conf->ux.uid = -1;
++	bind_conf->ux.gid = -1;
++	bind_conf->ux.mode = 0;
++
+ 	LIST_INIT(&bind_conf->listeners);
+ 	return bind_conf;
+ }
+diff --git a/include/types/listener.h b/include/types/listener.h
+index b8d64c4..82f23f1 100644
+--- a/include/types/listener.h
++++ b/include/types/listener.h
+@@ -105,6 +105,12 @@ struct bind_conf {
+ 	struct eb_root sni_w_ctx;  /* sni_ctx tree of all known certs wildcards sorted by name */
+ #endif
+ 	int is_ssl;                /* SSL is required for these listeners */
++	struct {                   /* UNIX socket permissions */
++		uid_t uid;         /* -1 to leave unchanged */
++		gid_t gid;         /* -1 to leave unchanged */
++		mode_t mode;       /* 0 to leave unchanged */
++	} ux;
++	int level;                 /* stats access level (ACCESS_LVL_*) */
+ 	struct list by_fe;         /* next binding for the same frontend, or NULL */
+ 	struct list listeners;     /* list of listeners using this bind config */
+ 	char *arg;                 /* argument passed to "bind" for better error reporting */
+@@ -136,14 +142,6 @@ struct listener {
+ 	struct list wait_queue;		/* link element to make the listener wait for something (LI_LIMITED)  */
+ 	unsigned int analysers;		/* bitmap of required protocol analysers */
+ 	int nice;			/* nice value to assign to the instanciated tasks */
+-	union {				/* protocol-dependant access restrictions */
+-		struct {		/* UNIX socket permissions */
+-			uid_t uid;	/* -1 to leave unchanged */
+-			gid_t gid;	/* -1 to leave unchanged */
+-			mode_t mode;	/* 0 to leave unchanged */
+-			int level;	/* access level (ACCESS_LVL_*) */
+-		} ux;
+-	} perm;
+ 	char *interface;		/* interface name or NULL */
+ 	int maxseg;			/* for TCP, advertised MSS */
+ 
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 07cc837..e2b7ba3 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -285,8 +285,6 @@ static int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bin
+ 				tcpv6_add_listener(l);
+ 			}
+ 			else {
+-				l->perm.ux.gid = l->perm.ux.uid = -1;
+-				l->perm.ux.mode = 0;
+ 				uxst_add_listener(l);
+ 			}
+ 
+@@ -1696,6 +1694,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 		}
+ 
+ 		bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[1]);
++		memcpy(&bind_conf->ux, &global.unix_bind.ux, sizeof(global.unix_bind.ux));
+ 
+ 		/* NOTE: the following line might create several listeners if there
+ 		 * are comma-separated IPs or port ranges. So all further processing
+@@ -1708,8 +1707,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 
+ 		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+ 			/* Set default global rights and owner for unix bind  */
+-			if (l->addr.ss_family == AF_UNIX)
+-				memcpy(&(l->perm.ux), &(global.unix_bind.ux), sizeof(global.unix_bind.ux));
+ 			global.maxsock++;
+ 		}
+ 
+diff --git a/src/dumpstats.c b/src/dumpstats.c
+index 5cd903b..1a860fd 100644
+--- a/src/dumpstats.c
++++ b/src/dumpstats.c
+@@ -212,6 +212,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+ 		}
+ 
+ 		bind_conf = bind_conf_alloc(&global.stats_fe->conf.bind, file, line, args[2]);
++		bind_conf->level = ACCESS_LVL_OPER; /* default access level */
+ 
+ 		global.stats_sock.state = LI_INIT;
+ 		global.stats_sock.options = LI_O_UNLIMITED;
+@@ -221,7 +222,6 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+ 		global.stats_sock.analysers = 0;
+ 		global.stats_sock.nice = -64;  /* we want to boost priority for local stats */
+ 		global.stats_sock.frontend = global.stats_fe;
+-		global.stats_sock.perm.ux.level = ACCESS_LVL_OPER; /* default access level */
+ 		global.stats_sock.maxconn = global.stats_fe->maxconn;
+ 		global.stats_sock.timeout = &global.stats_fe->timeout.client;
+ 		global.stats_sock.bind_conf = bind_conf;
+@@ -231,15 +231,15 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+ 		cur_arg = 3;
+ 		while (*args[cur_arg]) {
+ 			if (!strcmp(args[cur_arg], "uid")) {
+-				global.stats_sock.perm.ux.uid = atol(args[cur_arg + 1]);
++				bind_conf->ux.uid = atol(args[cur_arg + 1]);
+ 				cur_arg += 2;
+ 			}
+ 			else if (!strcmp(args[cur_arg], "gid")) {
+-				global.stats_sock.perm.ux.gid = atol(args[cur_arg + 1]);
++				bind_conf->ux.gid = atol(args[cur_arg + 1]);
+ 				cur_arg += 2;
+ 			}
+ 			else if (!strcmp(args[cur_arg], "mode")) {
+-				global.stats_sock.perm.ux.mode = strtol(args[cur_arg + 1], NULL, 8);
++				bind_conf->ux.mode = strtol(args[cur_arg + 1], NULL, 8);
+ 				cur_arg += 2;
+ 			}
+ 			else if (!strcmp(args[cur_arg], "user")) {
+@@ -249,7 +249,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+ 					memprintf(err, "'%s %s' : unknown user '%s'", args[0], args[1], args[cur_arg + 1]);
+ 					return -1;
+ 				}
+-				global.stats_sock.perm.ux.uid = user->pw_uid;
++				bind_conf->ux.uid = user->pw_uid;
+ 				cur_arg += 2;
+ 			}
+ 			else if (!strcmp(args[cur_arg], "group")) {
+@@ -259,16 +259,16 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
+ 					memprintf(err, "'%s %s' : unknown group '%s'", args[0], args[1], args[cur_arg + 1]);
+ 					return -1;
+ 				}
+-				global.stats_sock.perm.ux.gid = group->gr_gid;
++				bind_conf->ux.gid = group->gr_gid;
+ 				cur_arg += 2;
+ 			}
+ 			else if (!strcmp(args[cur_arg], "level")) {
+ 				if (!strcmp(args[cur_arg+1], "user"))
+-					global.stats_sock.perm.ux.level = ACCESS_LVL_USER;
++					bind_conf->level = ACCESS_LVL_USER;
+ 				else if (!strcmp(args[cur_arg+1], "operator"))
+-					global.stats_sock.perm.ux.level = ACCESS_LVL_OPER;
++					bind_conf->level = ACCESS_LVL_OPER;
+ 				else if (!strcmp(args[cur_arg+1], "admin"))
+-					global.stats_sock.perm.ux.level = ACCESS_LVL_ADMIN;
++					bind_conf->level = ACCESS_LVL_ADMIN;
+ 				else {
+ 					memprintf(err, "'%s %s' : '%s' only supports 'user', 'operator', and 'admin' (got '%s')",
+ 						  args[0], args[1], args[cur_arg], args[cur_arg+1]);
+@@ -432,7 +432,7 @@ static int stats_dump_table_head_to_buffer(struct chunk *msg, struct stream_inte
+ 
+ 	/* any other information should be dumped here */
+ 
+-	if (target && s->listener->perm.ux.level < ACCESS_LVL_OPER)
++	if (target && s->listener->bind_conf->level < ACCESS_LVL_OPER)
+ 		chunk_printf(msg, "# contents not dumped due to insufficient privileges\n");
+ 
+ 	if (bi_putchk(si->ib, msg) == -1)
+@@ -581,7 +581,7 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
+ 	}
+ 
+ 	/* check permissions */
+-	if (s->listener->perm.ux.level < ACCESS_LVL_OPER) {
++	if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
+ 		si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 		si->applet.st0 = STAT_CLI_PRINT;
+ 		return;
+@@ -769,7 +769,7 @@ static struct proxy *expect_frontend_admin(struct session *s, struct stream_inte
+ {
+ 	struct proxy *px;
+ 
+-	if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
++	if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+ 		si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 		si->applet.st0 = STAT_CLI_PRINT;
+ 		return NULL;
+@@ -801,7 +801,7 @@ static struct server *expect_server_admin(struct session *s, struct stream_inter
+ 	struct server *sv;
+ 	char *line;
+ 
+-	if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
++	if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+ 		si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 		si->applet.st0 = STAT_CLI_PRINT;
+ 		return NULL;
+@@ -893,7 +893,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 		}
+ 		else if (strcmp(args[1], "sess") == 0) {
+ 			si->conn.data_st = STAT_ST_INIT;
+-			if (s->listener->perm.ux.level < ACCESS_LVL_OPER) {
++			if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
+ 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 				si->applet.st0 = STAT_CLI_PRINT;
+ 				return 1;
+@@ -907,7 +907,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 			si->applet.st0 = STAT_CLI_O_SESS; // stats_dump_sess_to_buffer
+ 		}
+ 		else if (strcmp(args[1], "errors") == 0) {
+-			if (s->listener->perm.ux.level < ACCESS_LVL_OPER) {
++			if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
+ 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 				si->applet.st0 = STAT_CLI_PRINT;
+ 				return 1;
+@@ -938,8 +938,8 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 				clrall = 1;
+ 
+ 			/* check permissions */
+-			if (s->listener->perm.ux.level < ACCESS_LVL_OPER ||
+-			    (clrall && s->listener->perm.ux.level < ACCESS_LVL_ADMIN)) {
++			if (s->listener->bind_conf->level < ACCESS_LVL_OPER ||
++			    (clrall && s->listener->bind_conf->level < ACCESS_LVL_ADMIN)) {
+ 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 				si->applet.st0 = STAT_CLI_PRINT;
+ 				return 1;
+@@ -1167,7 +1167,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 			else if (strcmp(args[2], "global") == 0) {
+ 				int v;
+ 
+-				if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
++				if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+ 					si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 					si->applet.st0 = STAT_CLI_PRINT;
+ 					return 1;
+@@ -1209,7 +1209,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 				if (strcmp(args[3], "global") == 0) {
+ 					int v;
+ 
+-					if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
++					if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+ 						si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 						si->applet.st0 = STAT_CLI_PRINT;
+ 						return 1;
+@@ -1388,7 +1388,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 		else if (strcmp(args[1], "session") == 0) {
+ 			struct session *sess, *ptr;
+ 
+-			if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
++			if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+ 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
+ 				si->applet.st0 = STAT_CLI_PRINT;
+ 				return 1;
+@@ -3812,7 +3812,7 @@ static int stats_table_request(struct stream_interface *si, bool show)
+ 					return 0;
+ 
+ 				if (si->applet.ctx.table.target &&
+-				    s->listener->perm.ux.level >= ACCESS_LVL_OPER) {
++				    s->listener->bind_conf->level >= ACCESS_LVL_OPER) {
+ 					/* dump entries only if table explicitly requested */
+ 					eb = ebmb_first(&si->applet.ctx.table.proxy->table.keys);
+ 					if (eb) {
+diff --git a/src/haproxy.c b/src/haproxy.c
+index 07c4f3f..767ac2e 100644
+--- a/src/haproxy.c
++++ b/src/haproxy.c
+@@ -110,15 +110,6 @@ int  relative_pid = 1;		/* process id starting at 1 */
+ struct global global = {
+ 	.req_count = 0,
+ 	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
+-	.stats_sock = {
+-		.perm = {
+-			 .ux = {
+-				 .uid = -1,
+-				 .gid = -1,
+-				 .mode = 0,
+-			 }
+-		 }
+-	},
+ 	.unix_bind = {
+ 		 .ux = {
+ 			 .uid = -1,
+diff --git a/src/proto_uxst.c b/src/proto_uxst.c
+index 58fd06d..3757236 100644
+--- a/src/proto_uxst.c
++++ b/src/proto_uxst.c
+@@ -233,9 +233,9 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
+ 	 * While it is known not to be portable on every OS, it's still useful
+ 	 * where it works.
+ 	 */
+-	if (((listener->perm.ux.uid != -1 || listener->perm.ux.gid != -1) &&
+-	     (chown(tempname, listener->perm.ux.uid, listener->perm.ux.gid) == -1)) ||
+-	    (listener->perm.ux.mode != 0 && chmod(tempname, listener->perm.ux.mode) == -1)) {
++	if (((listener->bind_conf->ux.uid != -1 || listener->bind_conf->ux.gid != -1) &&
++	     (chown(tempname, listener->bind_conf->ux.uid, listener->bind_conf->ux.gid) == -1)) ||
++	    (listener->bind_conf->ux.mode != 0 && chmod(tempname, listener->bind_conf->ux.mode) == -1)) {
+ 		msg = "cannot change UNIX socket ownership";
+ 		goto err_unlink_temp;
+ 	}
+@@ -351,50 +351,32 @@ static int uxst_unbind_listeners(struct protocol *proto)
+ /* parse the "mode" bind keyword */
+ static int bind_parse_mode(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	struct listener *l;
+-	int val;
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing mode (octal integer expected)", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	val = strtol(args[cur_arg + 1], NULL, 8);
+-
+-	list_for_each_entry(l, &conf->listeners, by_bind) {
+-		if (l->addr.ss_family == AF_UNIX)
+-			l->perm.ux.mode = val;
+-	}
+-
++	conf->ux.mode = strtol(args[cur_arg + 1], NULL, 8);
+ 	return 0;
+ }
+ 
+ /* parse the "gid" bind keyword */
+ static int bind_parse_gid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	struct listener *l;
+-	int val;
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	val = atol(args[cur_arg + 1]);
+-	list_for_each_entry(l, &conf->listeners, by_bind) {
+-		if (l->addr.ss_family == AF_UNIX)
+-			l->perm.ux.gid = val;
+-	}
+-
++	conf->ux.gid = atol(args[cur_arg + 1]);
+ 	return 0;
+ }
+ 
+ /* parse the "group" bind keyword */
+ static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	struct listener *l;
+ 	struct group *group;
+ 
+ 	if (!*args[cur_arg + 1]) {
+@@ -410,39 +392,26 @@ static int bind_parse_group(char **args, int cur_arg, struct proxy *px, struct b
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	list_for_each_entry(l, &conf->listeners, by_bind) {
+-		if (l->addr.ss_family == AF_UNIX)
+-			l->perm.ux.gid = group->gr_gid;
+-	}
+-
++	conf->ux.gid = group->gr_gid;
+ 	return 0;
+ }
+ 
+ /* parse the "uid" bind keyword */
+ static int bind_parse_uid(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	struct listener *l;
+-	int val;
+-
+ 	if (!*args[cur_arg + 1]) {
+ 		if (err)
+ 			memprintf(err, "'%s' : missing value", args[cur_arg]);
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	val = atol(args[cur_arg + 1]);
+-	list_for_each_entry(l, &conf->listeners, by_bind) {
+-		if (l->addr.ss_family == AF_UNIX)
+-			l->perm.ux.uid = val;
+-	}
+-
++	conf->ux.uid = atol(args[cur_arg + 1]);
+ 	return 0;
+ }
+ 
+ /* parse the "user" bind keyword */
+ static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
+-	struct listener *l;
+ 	struct passwd *user;
+ 
+ 	if (!*args[cur_arg + 1]) {
+@@ -458,11 +427,7 @@ static int bind_parse_user(char **args, int cur_arg, struct proxy *px, struct bi
+ 		return ERR_ALERT | ERR_FATAL;
+ 	}
+ 
+-	list_for_each_entry(l, &conf->listeners, by_bind) {
+-		if (l->addr.ss_family == AF_UNIX)
+-			l->perm.ux.uid = user->pw_uid;
+-	}
+-
++	conf->ux.uid = user->pw_uid;
+ 	return 0;
+ }
+ 
+-- 
+1.7.1
+

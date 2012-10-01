@@ -1,0 +1,195 @@
+From 269826659d4cbb161cd11160dc14a3d7ffb4ed35 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Wed, 12 Sep 2012 23:17:10 +0200
+Subject: MEDIUM: listener: add a minimal framework to register "bind" keyword options
+
+With the arrival of SSL, the "bind" keyword has received even more options,
+all of which are processed in cfgparse in a cumbersome way. So it's time to
+let modules register their own bind options. This is done very similarly to
+the ACLs with a small difference in that we make the difference between an
+unknown option and a known, unimplemented option.
+---
+ include/proto/listener.h |    9 +++++++++
+ include/types/listener.h |   25 +++++++++++++++++++++++++
+ src/cfgparse.c           |   37 +++++++++++++++++++++++++++++++++++++
+ src/listener.c           |   46 ++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 117 insertions(+), 0 deletions(-)
+
+diff --git a/include/proto/listener.h b/include/proto/listener.h
+index 4019ff1..e570a9b 100644
+--- a/include/proto/listener.h
++++ b/include/proto/listener.h
+@@ -105,6 +105,15 @@ void delete_listener(struct listener *listener);
+  */
+ int listener_accept(int fd);
+ 
++/*
++ * Registers the bind keyword list <kwl> as a list of valid keywords for next
++ * parsing sessions.
++ */
++void bind_register_keywords(struct bind_kw_list *kwl);
++
++/* Return a pointer to the bind keyword <kw>, or NULL if not found. */
++struct bind_kw *bind_find_kw(const char *kw);
++
+ /* allocate an bind_conf struct for a bind line, and chain it to list head <lh>.
+  * If <arg> is not NULL, it is duplicated into ->arg to store useful config
+  * information for error reporting.
+diff --git a/include/types/listener.h b/include/types/listener.h
+index 2406148..f21a28d 100644
+--- a/include/types/listener.h
++++ b/include/types/listener.h
+@@ -156,6 +156,31 @@ struct listener {
+ 	} conf;				/* config information */
+ };
+ 
++/* Descriptor for a "bind" keyword. The ->parse() function returns 0 in case of
++ * success, or a combination of ERR_* flags if an error is encountered. The
++ * function pointer can be NULL if not implemented. The function also has an
++ * access to the current "bind" conf, which is the conf of the last listener,
++ * reachable via px->listen->bind_conf. The ->skip value tells the parser how
++ * many words have to be skipped after the keyword.
++ */
++struct bind_kw {
++	const char *kw;
++	int (*parse)(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err);
++	int skip; /* nb of args to skip */
++};
++
++/*
++ * A keyword list. It is a NULL-terminated array of keywords. It embeds a
++ * struct list in order to be linked to other lists, allowing it to easily
++ * be declared where it is needed, and linked without duplicating data nor
++ * allocating memory.
++ */
++struct bind_kw_list {
++	struct list list;
++	struct bind_kw kw[VAR_ARRAY];
++};
++
++
+ #endif /* _TYPES_LISTENER_H */
+ 
+ /*
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 07b7347..c0b29c6 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1711,6 +1711,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 		}
+ 		cur_arg = 2;
+ 		while (*(args[cur_arg])) {
++			struct bind_kw *kw;
++
+ 			if (!strcmp(args[cur_arg], "interface")) { /* specifically bind to this interface */
+ #ifdef SO_BINDTODEVICE
+ 				struct listener *l;
+@@ -2147,6 +2149,41 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
+ 				continue;
+                         }
+ 
++			kw = bind_find_kw(args[cur_arg]);
++			if (kw) {
++				char *err = NULL;
++				int code;
++
++				if (!kw->parse) {
++					Alert("parsing [%s:%d] : '%s' : '%s' option is not implemented in this version (check build options).\n",
++					      file, linenum, args[0], args[cur_arg]);
++					cur_arg += 1 + kw->skip ;
++					err_code |= ERR_ALERT | ERR_FATAL;
++					goto out;
++				}
++
++				code = kw->parse(args, cur_arg, curproxy, last_listen, &err);
++				err_code |= code;
++
++				if (code) {
++					if (err && *err) {
++						indent_msg(&err, 2);
++						Alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], err);
++					}
++					else
++						Alert("parsing [%s:%d] : '%s' : error encountered while processing '%s'.\n",
++						      file, linenum, args[0], args[cur_arg]);
++					if (code & ERR_FATAL) {
++						free(err);
++						cur_arg += 1 + kw->skip;
++						goto out;
++					}
++				}
++				free(err);
++				cur_arg += 1 + kw->skip;
++				continue;
++			}
++
+ 			Alert("parsing [%s:%d] : '%s' only supports the 'transparent', 'accept-proxy', 'defer-accept', 'name', 'id', 'mss', 'mode', 'uid', 'gid', 'user', 'group' and 'interface' options.\n",
+ 			      file, linenum, args[0]);
+ 			err_code |= ERR_ALERT | ERR_FATAL;
+diff --git a/src/listener.c b/src/listener.c
+index 0e864b2..13eb272 100644
+--- a/src/listener.c
++++ b/src/listener.c
+@@ -29,6 +29,11 @@
+ #include <proto/log.h>
+ #include <proto/task.h>
+ 
++/* List head of all known bind keywords */
++static struct bind_kw_list bind_keywords = {
++	.list = LIST_HEAD_INIT(bind_keywords.list)
++};
++
+ /* This function adds the specified listener's file descriptor to the polling
+  * lists if it is in the LI_LISTEN state. The listener enters LI_READY or
+  * LI_FULL state depending on its number of connections.
+@@ -409,6 +414,47 @@ void listener_accept(int fd)
+ 	return;
+ }
+ 
++/*
++ * Registers the bind keyword list <kwl> as a list of valid keywords for next
++ * parsing sessions.
++ */
++void bind_register_keywords(struct bind_kw_list *kwl)
++{
++	LIST_ADDQ(&bind_keywords.list, &kwl->list);
++}
++
++/* Return a pointer to the bind keyword <kw>, or NULL if not found. If the
++ * keyword is found with a NULL ->parse() function, then an attempt is made to
++ * find one with a valid ->parse() function. This way it is possible to declare
++ * platform-dependant, known keywords as NULL, then only declare them as valid
++ * if some options are met. Note that if the requested keyword contains an
++ * opening parenthesis, everything from this point is ignored.
++ */
++struct bind_kw *bind_find_kw(const char *kw)
++{
++	int index;
++	const char *kwend;
++	struct bind_kw_list *kwl;
++	struct bind_kw *ret = NULL;
++
++	kwend = strchr(kw, '(');
++	if (!kwend)
++		kwend = kw + strlen(kw);
++
++	list_for_each_entry(kwl, &bind_keywords.list, list) {
++		for (index = 0; kwl->kw[index].kw != NULL; index++) {
++			if ((strncmp(kwl->kw[index].kw, kw, kwend - kw) == 0) &&
++			    kwl->kw[index].kw[kwend-kw] == 0) {
++				if (kwl->kw[index].parse)
++					return &kwl->kw[index]; /* found it !*/
++				else
++					ret = &kwl->kw[index];  /* may be OK */
++			}
++		}
++	}
++	return ret;
++}
++
+ /************************************************************************/
+ /*           All supported ACL keywords must be declared here.          */
+ /************************************************************************/
+-- 
+1.7.1
+

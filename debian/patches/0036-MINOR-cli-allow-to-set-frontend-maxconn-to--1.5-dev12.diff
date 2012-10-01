@@ -1,0 +1,52 @@
+From 3c7a79dbb1ecb35717c7a730bec3546aad1c0ede Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Wed, 26 Sep 2012 21:07:15 +0200
+Subject: MINOR: cli: allow to set frontend maxconn to zero
+
+It is sometimes useful to completely disable accepting new connections
+on a frontend during maintenance operations. By setting a frontend's
+maxconn to zero, connections are not accepted anymore until the limit
+is increased again.
+---
+ doc/configuration.txt |   10 +++++-----
+ src/dumpstats.c       |    3 +--
+ 2 files changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/doc/configuration.txt b/doc/configuration.txt
+index a270d69..3788ac0 100644
+--- a/doc/configuration.txt
++++ b/doc/configuration.txt
+@@ -10464,11 +10464,11 @@ quit
+   Close the connection when in interactive mode.
+ 
+ set maxconn frontend <frontend> <value>
+-  Dynamically change the specified frontend's maxconn setting. Any non-null
+-  positive value is allowed, but setting values larger than the global maxconn
+-  does not make much sense. If the limit is increased and connections were
+-  pending, they will immediately be accepted. If it is lowered to a value below
+-  the current number of connections, new connections acceptation will be
++  Dynamically change the specified frontend's maxconn setting. Any positive
++  value is allowed including zero, but setting values larger than the global
++  maxconn does not make much sense. If the limit is increased and connections
++  were pending, they will immediately be accepted. If it is lowered to a value
++  below the current number of connections, new connections acceptation will be
+   delayed until the threshold is reached. The frontend might be specified by
+   either its name or its numeric ID prefixed with a sharp ('#').
+ 
+diff --git a/src/dumpstats.c b/src/dumpstats.c
+index 7c01e79..c8b60a6 100644
+--- a/src/dumpstats.c
++++ b/src/dumpstats.c
+@@ -1113,8 +1113,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
+ 				}
+ 
+ 				v = atoi(args[4]);
+-				/* check for unlimited values, we restore default setting (cfg_maxpconn) */
+-				if (v < 1) {
++				if (v < 0) {
+ 					si->applet.ctx.cli.msg = "Value out of range.\n";
+ 					si->applet.st0 = STAT_CLI_PRINT;
+ 					return 1;
+-- 
+1.7.1
+

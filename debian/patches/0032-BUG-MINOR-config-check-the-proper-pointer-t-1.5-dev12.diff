@@ -1,0 +1,37 @@
+From 173e7fbd94627cc0a1454dd303d41b8d5d922a1d Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Mon, 24 Sep 2012 22:47:39 +0200
+Subject: BUG/MINOR: config: check the proper pointer to report unknown protocol
+
+Check the protocol pointer and not the socket to report an unknown family
+in servers or peers. This can never happen anyway, it's just to be completely
+clean.
+---
+ src/cfgparse.c |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 7e4db74..cd3a559 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1309,7 +1309,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
+ 		newpeer->data  = &raw_sock;
+ 		newpeer->sock_init_arg = NULL;
+ 
+-		if (!sk) {
++		if (!newpeer->proto) {
+ 			Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
+ 			      file, linenum, newpeer->addr.ss_family, args[2]);
+ 			err_code |= ERR_ALERT | ERR_FATAL;
+@@ -3951,7 +3951,7 @@ stats_error_parsing:
+ 			newsrv->proto = protocol_by_family(newsrv->addr.ss_family);
+ 			newsrv->data  = &raw_sock;
+ 
+-			if (!sk) {
++			if (!newsrv->proto) {
+ 				Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
+ 				      file, linenum, newsrv->addr.ss_family, args[2]);
+ 				err_code |= ERR_ALERT | ERR_FATAL;
+-- 
+1.7.1
+

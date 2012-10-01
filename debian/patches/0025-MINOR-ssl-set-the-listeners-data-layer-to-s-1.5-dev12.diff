@@ -1,0 +1,49 @@
+From 81796be87c391734c68fc40fa95436d429a0356e Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sat, 22 Sep 2012 19:11:47 +0200
+Subject: MINOR: ssl: set the listeners' data layer to ssl during parsing
+
+It's better to set all listeners to ssl_sock when seeing the "ssl"
+keyword that to loop on all of them afterwards just for this. This
+also removes some #ifdefs.
+---
+ src/cfgparse.c |    5 +----
+ src/ssl_sock.c |    5 +++++
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 0565cd3..7e4db74 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -6568,10 +6568,7 @@ out_uri_auth_compat:
+ 					listener->name = strdup(trash);
+ 				}
+ 			}
+-#ifdef USE_OPENSSL
+-			if (listener->bind_conf->is_ssl && listener->bind_conf->default_ctx)
+-				listener->data = &ssl_sock; /* SSL data layer */
+-#endif
++
+ 			if (curproxy->options & PR_O_TCP_NOLING)
+ 				listener->options |= LI_O_NOLINGER;
+ 			if (!listener->maxconn)
+diff --git a/src/ssl_sock.c b/src/ssl_sock.c
+index 3c997eb..4862a9a 100644
+--- a/src/ssl_sock.c
++++ b/src/ssl_sock.c
+@@ -863,7 +863,12 @@ static int bind_parse_psc(char **args, int cur_arg, struct proxy *px, struct bin
+ /* parse the "ssl" bind keyword */
+ static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+ {
++	struct listener *l;
++
+ 	conf->is_ssl = 1;
++	list_for_each_entry(l, &conf->listeners, by_bind)
++		l->data = &ssl_sock;
++
+ 	return 0;
+ }
+ 
+-- 
+1.7.1
+
