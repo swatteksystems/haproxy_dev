@@ -26,13 +26,14 @@
 #include <common/time.h>
 
 #include <types/global.h>
+#include <types/obj_type.h>
 #include <types/peers.h>
 
 #include <proto/backend.h>
 #include <proto/fd.h>
 #include <proto/hdr_idx.h>
+#include <proto/listener.h>
 #include <proto/log.h>
-#include <proto/protocols.h>
 #include <proto/proto_tcp.h>
 #include <proto/proto_http.h>
 #include <proto/proxy.h>
@@ -96,17 +97,17 @@ int get_backend_server(const char *bk_name, const char *sv_name,
 
 	*sv = NULL;
 
-	pid = 0;
+	pid = -1;
 	if (*bk_name == '#')
 		pid = atoi(bk_name + 1);
-	sid = 0;
+	sid = -1;
 	if (*sv_name == '#')
 		sid = atoi(sv_name + 1);
 
 	for (p = proxy; p; p = p->next)
 		if ((p->cap & PR_CAP_BE) &&
-		    ((pid && p->uuid == pid) ||
-		     (!pid && strcmp(p->id, bk_name) == 0)))
+		    ((pid >= 0 && p->uuid == pid) ||
+		     (pid < 0 && strcmp(p->id, bk_name) == 0)))
 			break;
 	if (bk)
 		*bk = p;
@@ -114,8 +115,8 @@ int get_backend_server(const char *bk_name, const char *sv_name,
 		return 0;
 
 	for (s = p->srv; s; s = s->next)
-		if ((sid && s->puid == sid) ||
-		    (!sid && strcmp(s->id, sv_name) == 0))
+		if ((sid >= 0 && s->puid == sid) ||
+		    (sid < 0 && strcmp(s->id, sv_name) == 0))
 			break;
 	*sv = s;
 	if (!s)
@@ -133,7 +134,8 @@ int get_backend_server(const char *bk_name, const char *sv_name,
  * "{cli|srv|con}timeout" in args[0].
  */
 static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
-                               struct proxy *defpx, char **err)
+                               struct proxy *defpx, const char *file, int line,
+                               char **err)
 {
 	unsigned timeout;
 	int retval, cap;
@@ -229,7 +231,8 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
  * parsed, and <defpx> to the default proxy or NULL.
  */
 static int proxy_parse_rate_limit(char **args, int section, struct proxy *proxy,
-                                  struct proxy *defpx, char **err)
+                                  struct proxy *defpx, const char *file, int line,
+                                  char **err)
 {
 	int retval, cap;
 	char *res;
@@ -318,15 +321,15 @@ struct proxy *findproxy_mode(const char *name, int mode, int cap) {
 struct proxy *findproxy(const char *name, int cap) {
 
 	struct proxy *curproxy, *target = NULL;
-	int pid = 0;
+	int pid = -1;
 
 	if (*name == '#')
 		pid = atoi(name + 1);
 
 	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
 		if ((curproxy->cap & cap) != cap ||
-		    (pid && curproxy->uuid != pid) ||
-		    (!pid && strcmp(curproxy->id, name)))
+		    (pid >= 0 && curproxy->uuid != pid) ||
+		    (pid < 0 && strcmp(curproxy->id, name)))
 			continue;
 
 		if (!target) {
@@ -423,6 +426,7 @@ int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 void init_new_proxy(struct proxy *p)
 {
 	memset(p, 0, sizeof(struct proxy));
+	p->obj_type = OBJ_TYPE_PROXY;
 	LIST_INIT(&p->pendconns);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
@@ -443,11 +447,15 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->logsrvs);
 	LIST_INIT(&p->logformat);
 	LIST_INIT(&p->format_unique_id);
-	LIST_INIT(&p->conf.ssl_bind);
+	LIST_INIT(&p->conf.bind);
+	LIST_INIT(&p->conf.listeners);
 
 	/* Timeouts are defined as -1 */
 	proxy_reset_timeouts(p);
 	p->tcp_rep.inspect_delay = TICK_ETERNITY;
+
+	/* initial uuid is unassigned (-1) */
+	p->uuid = -1;
 }
 
 /*
@@ -473,7 +481,7 @@ int start_proxies(int verbose)
 			continue; /* already initialized */
 
 		pxerr = 0;
-		for (listener = curproxy->listen; listener != NULL; listener = listener->next) {
+		list_for_each_entry(listener, &curproxy->conf.listeners, by_fe) {
 			if (listener->state != LI_ASSIGNED)
 				continue; /* already started */
 
@@ -606,7 +614,8 @@ void soft_stop(void)
 			 task_wakeup(p->table.sync_task, TASK_WOKEN_MSG);
 
 		/* wake every proxy task up so that they can handle the stopping */
-		task_wakeup(p->task, TASK_WOKEN_MSG);
+		if (p->task)
+			task_wakeup(p->task, TASK_WOKEN_MSG);
 		p = p->next;
 	}
 
@@ -637,7 +646,7 @@ int pause_proxy(struct proxy *p)
 	Warning("Pausing %s %s.\n", proxy_cap_str(p->cap), p->id);
 	send_log(p, LOG_WARNING, "Pausing %s %s.\n", proxy_cap_str(p->cap), p->id);
 
-	for (l = p->listen; l != NULL; l = l->next) {
+	list_for_each_entry(l, &p->conf.listeners, by_fe) {
 		if (!pause_listener(l))
 			p->state = PR_STERROR;
 	}
@@ -664,7 +673,7 @@ void stop_proxy(struct proxy *p)
 {
 	struct listener *l;
 
-	for (l = p->listen; l != NULL; l = l->next) {
+	list_for_each_entry(l, &p->conf.listeners, by_fe) {
 		unbind_listener(l);
 		if (l->state >= LI_ASSIGNED) {
 			delete_listener(l);
@@ -692,7 +701,7 @@ int resume_proxy(struct proxy *p)
 	send_log(p, LOG_WARNING, "Enabling %s %s.\n", proxy_cap_str(p->cap), p->id);
 
 	fail = 0;
-	for (l = p->listen; l != NULL; l = l->next) {
+	list_for_each_entry(l, &p->conf.listeners, by_fe) {
 		if (!resume_listener(l)) {
 			int port;
 

@@ -23,8 +23,16 @@
 #define _PROTO_CONNECTION_H
 
 #include <common/config.h>
+#include <common/memory.h>
 #include <types/connection.h>
-#include <types/protocols.h>
+#include <types/listener.h>
+#include <proto/fd.h>
+#include <proto/obj_type.h>
+
+extern struct pool_head *pool2_connection;
+
+/* perform minimal intializations, report 0 in case of error, 1 if OK. */
+int init_connection();
 
 /* I/O callback for fd-based connections. It calls the read/write handlers
  * provided by the connection's sock_ops. Returns 0.
@@ -33,29 +41,54 @@ int conn_fd_handler(int fd);
 
 /* receive a PROXY protocol header over a connection */
 int conn_recv_proxy(struct connection *conn, int flag);
+int make_proxy_line(char *buf, int buf_len, struct sockaddr_storage *src, struct sockaddr_storage *dst);
 
-/* calls the init() function of the data layer if any. Returns <0 in case of
- * error.
+/* calls the init() function of the transport layer if any.
+ * Returns <0 in case of error.
  */
-static inline int conn_data_init(struct connection *conn)
+static inline int conn_xprt_init(struct connection *conn)
 {
-	if (conn->data && conn->data->init)
-		return conn->data->init(conn);
+	if (conn->xprt && conn->xprt->init)
+		return conn->xprt->init(conn);
 	return 0;
 }
 
-/* Calls the close() function of the data layer if any */
-static inline void conn_data_close(struct connection *conn)
+/* Calls the close() function of the transport layer if any, and always unsets
+ * the transport layer. However this is not done if the CO_FL_XPRT_TRACKED flag
+ * is set, which allows logs to take data from the transport layer very late if
+ * needed.
+ */
+static inline void conn_xprt_close(struct connection *conn)
 {
-	if (conn->data && conn->data->close)
-		conn->data->close(conn);
+	if (conn->xprt && !(conn->flags & CO_FL_XPRT_TRACKED)) {
+		if (conn->xprt->close)
+			conn->xprt->close(conn);
+		conn->xprt = NULL;
+	}
+}
+
+/* If the connection still has a transport layer, then call its close() function
+ * if any, and delete the file descriptor if a control layer is set. This is
+ * used to close everything at once and atomically. However this is not done if
+ * the CO_FL_XPRT_TRACKED flag is set, which allows logs to take data from the
+ * transport layer very late if needed.
+ */
+static inline void conn_full_close(struct connection *conn)
+{
+	if (conn->xprt && !(conn->flags & CO_FL_XPRT_TRACKED)) {
+		if (conn->xprt->close)
+			conn->xprt->close(conn);
+		if (conn->ctrl)
+			fd_delete(conn->t.sock.fd);
+		conn->xprt = NULL;
+	}
 }
 
 /* Update polling on connection <c>'s file descriptor depending on its current
  * state as reported in the connection's CO_FL_CURR_* flags, reports of EAGAIN
  * in CO_FL_WAIT_*, and the sock layer expectations indicated by CO_FL_SOCK_*.
  * The connection flags are updated with the new flags at the end of the
- * operation.
+ * operation. Polling is totally disabled if an error was reported.
  */
 void conn_update_sock_polling(struct connection *c);
 
@@ -63,28 +96,70 @@ void conn_update_sock_polling(struct connection *c);
  * state as reported in the connection's CO_FL_CURR_* flags, reports of EAGAIN
  * in CO_FL_WAIT_*, and the data layer expectations indicated by CO_FL_DATA_*.
  * The connection flags are updated with the new flags at the end of the
- * operation.
+ * operation. Polling is totally disabled if an error was reported.
  */
 void conn_update_data_polling(struct connection *c);
 
+/* This callback is used to send a valid PROXY protocol line to a socket being
+ * established from the local machine. It sets the protocol addresses to the
+ * local and remote address. This is typically used with health checks or when
+ * it is not possible to determine the other end's address. It returns 0 if it
+ * fails in a fatal way or needs to poll to go further, otherwise it returns
+ * non-zero and removes itself from the connection's flags (the bit is provided
+ * in <flag> by the caller). It is designed to be called by the connection
+ * handler and relies on it to commit polling changes. Note that this function
+ * expects to be able to send the whole line at once, which should always be
+ * possible since it is supposed to start at the first byte of the outgoing
+ * data segment.
+ */
+int conn_local_send_proxy(struct connection *conn, unsigned int flag);
+
 /* inspects c->flags and returns non-zero if DATA ENA changes from the CURR ENA
- * or if the WAIT flags set new flags that were not in CURR POL.
+ * or if the WAIT flags are set with their respective ENA flags. Additionally,
+ * non-zero is also returned if an error was reported on the connection. This
+ * function is used quite often and is inlined. In order to proceed optimally
+ * with very little code and CPU cycles, the bits are arranged so that a change
+ * can be detected by a few left shifts, a xor, and a mask. These operations
+ * detect when W&D are both enabled for either direction, when C&D differ for
+ * either direction and when Error is set. The trick consists in first keeping
+ * only the bits we're interested in, since they don't collide when shifted,
+ * and to perform the AND at the end. In practice, the compiler is able to
+ * replace the last AND with a TEST in boolean conditions. This results in
+ * checks that are done in 4-6 cycles and less than 30 bytes.
  */
 static inline unsigned int conn_data_polling_changes(const struct connection *c)
 {
-	return (((c->flags << 6) ^ (c->flags << 2)) |     /* changes in ENA go to bits 30&31 */
-		(((c->flags << 8) & ~c->flags))) &        /* new bits in POL go to bits 30&31 */
-		0xC0000000;
+	unsigned int f = c->flags;
+	f &= CO_FL_DATA_WR_ENA | CO_FL_DATA_RD_ENA | CO_FL_CURR_WR_ENA |
+	     CO_FL_CURR_RD_ENA | CO_FL_ERROR | CO_FL_WAIT_WR | CO_FL_WAIT_RD;
+
+	f = (f & (f << 2)) |                         /* test W & D */
+	    ((f ^ (f << 1)) & (CO_FL_CURR_WR_ENA|CO_FL_CURR_RD_ENA));    /* test C ^ D */
+	return f & (CO_FL_WAIT_WR | CO_FL_WAIT_RD | CO_FL_CURR_WR_ENA | CO_FL_CURR_RD_ENA | CO_FL_ERROR);
 }
 
 /* inspects c->flags and returns non-zero if SOCK ENA changes from the CURR ENA
- * or if the WAIT flags set new flags that were not in CURR POL.
+ * or if the WAIT flags are set with their respective ENA flags. Additionally,
+ * non-zero is also returned if an error was reported on the connection. This
+ * function is used quite often and is inlined. In order to proceed optimally
+ * with very little code and CPU cycles, the bits are arranged so that a change
+ * can be detected by a few left shifts, a xor, and a mask. These operations
+ * detect when W&S are both enabled for either direction, when C&S differ for
+ * either direction and when Error is set. The trick consists in first keeping
+ * only the bits we're interested in, since they don't collide when shifted,
+ * and to perform the AND at the end. In practice, the compiler is able to
+ * replace the last AND with a TEST in boolean conditions. This results in
+ * checks that are done in 4-6 cycles and less than 30 bytes.
  */
 static inline unsigned int conn_sock_polling_changes(const struct connection *c)
 {
-	return (((c->flags << 4) ^ (c->flags << 2)) |     /* changes in ENA go to bits 30&31 */
-		(((c->flags << 8) & ~c->flags))) &        /* new bits in POL go to bits 30&31 */
-		0xC0000000;
+	unsigned int f = c->flags;
+	f &= CO_FL_SOCK_WR_ENA | CO_FL_SOCK_RD_ENA | CO_FL_CURR_WR_ENA |
+	     CO_FL_CURR_RD_ENA | CO_FL_ERROR | CO_FL_WAIT_WR | CO_FL_WAIT_RD;
+
+	f = (f & (f << 3)) |                         /* test W & S */
+	    ((f ^ (f << 2)) & (CO_FL_CURR_WR_ENA|CO_FL_CURR_RD_ENA));    /* test C ^ S */
+	return f & (CO_FL_WAIT_WR | CO_FL_WAIT_RD | CO_FL_CURR_WR_ENA | CO_FL_CURR_RD_ENA | CO_FL_ERROR);
 }
 
 /* Automatically updates polling on connection <c> depending on the DATA flags
@@ -105,6 +180,17 @@ static inline void conn_cond_update_sock_polling(struct connection *c)
 		conn_update_sock_polling(c);
 }
 
+/* Stop all polling on the fd. This might be used when an error is encountered
+ * for example.
+ */
+static inline void conn_stop_polling(struct connection *c)
+{
+	c->flags &= ~(CO_FL_CURR_RD_ENA | CO_FL_CURR_WR_ENA |
+		      CO_FL_SOCK_RD_ENA | CO_FL_SOCK_WR_ENA |
+		      CO_FL_DATA_RD_ENA | CO_FL_DATA_WR_ENA);
+	fd_stop_both(c->t.sock.fd);
+}
+
 /* Automatically update polling on connection <c> depending on the DATA and
  * SOCK flags, and on whether a handshake is in progress or not. This may be
  * called at any moment when there is a doubt about the effectiveness of the
@@ -112,7 +198,9 @@ static inline void conn_cond_update_sock_polling(struct connection *c)
  */
 static inline void conn_cond_update_polling(struct connection *c)
 {
-	if (!(c->flags & CO_FL_POLL_SOCK) && conn_data_polling_changes(c))
+	if (unlikely(c->flags & CO_FL_ERROR))
+		conn_stop_polling(c);
+	else if (!(c->flags & CO_FL_POLL_SOCK) && conn_data_polling_changes(c))
 		conn_update_data_polling(c);
 	else if ((c->flags & CO_FL_POLL_SOCK) && conn_sock_polling_changes(c))
 		conn_update_sock_polling(c);
@@ -319,67 +407,6 @@ static inline int conn_sock_shutw_pending(struct connection *c)
 	return (c->flags & (CO_FL_DATA_WR_SH | CO_FL_SOCK_WR_SH)) == CO_FL_DATA_WR_SH;
 }
 
-static inline void clear_target(struct target *dest)
-{
-	dest->type = TARG_TYPE_NONE;
-	dest->ptr.v = NULL;
-}
-
-static inline void set_target_client(struct target *dest, struct listener *l)
-{
-	dest->type = TARG_TYPE_CLIENT;
-	dest->ptr.l = l;
-}
-
-static inline void set_target_server(struct target *dest, struct server *s)
-{
-	dest->type = TARG_TYPE_SERVER;
-	dest->ptr.s = s;
-}
-
-static inline void set_target_proxy(struct target *dest, struct proxy *p)
-{
-	dest->type = TARG_TYPE_PROXY;
-	dest->ptr.p = p;
-}
-
-static inline void set_target_applet(struct target *dest, struct si_applet *a)
-{
-	dest->type = TARG_TYPE_APPLET;
-	dest->ptr.a = a;
-}
-
-static inline void set_target_task(struct target *dest, struct task *t)
-{
-	dest->type = TARG_TYPE_TASK;
-	dest->ptr.t = t;
-}
-
-static inline struct target *copy_target(struct target *dest, struct target *src)
-{
-	*dest = *src;
-	return dest;
-}
-
-static inline int target_match(struct target *a, struct target *b)
-{
-	return a->type == b->type && a->ptr.v == b->ptr.v;
-}
-
-static inline struct server *target_srv(struct target *t)
-{
-	if (!t || t->type != TARG_TYPE_SERVER)
-		return NULL;
-	return t->ptr.s;
-}
-
-static inline struct listener *target_client(struct target *t)
-{
-	if (!t || t->type != TARG_TYPE_CLIENT)
-		return NULL;
-	return t->ptr.l;
-}
-
 /* Retrieves the connection's source address */
 static inline void conn_get_from_addr(struct connection *conn)
 {
@@ -390,8 +417,8 @@ static inline void conn_get_from_addr(struct connection *conn)
 		return;
 
 	if (conn->ctrl->get_src(conn->t.sock.fd, (struct sockaddr *)&conn->addr.from,
-	                         sizeof(conn->addr.from),
-	                         conn->target.type != TARG_TYPE_CLIENT) == -1)
+	                        sizeof(conn->addr.from),
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
 		return;
 	conn->flags |= CO_FL_ADDR_FROM_SET;
 }
@@ -406,12 +433,34 @@ static inline void conn_get_to_addr(struct connection *conn)
 		return;
 
 	if (conn->ctrl->get_dst(conn->t.sock.fd, (struct sockaddr *)&conn->addr.to,
-	                         sizeof(conn->addr.to),
-	                         conn->target.type != TARG_TYPE_CLIENT) == -1)
+	                        sizeof(conn->addr.to),
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
 		return;
 	conn->flags |= CO_FL_ADDR_TO_SET;
 }
 
+/* Assigns a connection with the appropriate data, ctrl, transport layers, and owner. */
+static inline void conn_assign(struct connection *conn, const struct data_cb *data,
+                               const struct protocol *ctrl, const struct xprt_ops *xprt,
+                               void *owner)
+{
+	conn->data = data;
+	conn->ctrl = ctrl;
+	conn->xprt = xprt;
+	conn->owner = owner;
+}
+
+/* prepares a connection with the appropriate data, ctrl, transport layers, and
+ * owner. The transport state and context are set to 0.
+ */
+static inline void conn_prepare(struct connection *conn, const struct data_cb *data,
+                                const struct protocol *ctrl, const struct xprt_ops *xprt,
+                                void *owner)
+{
+	conn_assign(conn, data, ctrl, xprt, owner);
+	conn->xprt_st = 0;
+	conn->xprt_ctx = NULL;
+}
 
 #endif /* _PROTO_CONNECTION_H */
 

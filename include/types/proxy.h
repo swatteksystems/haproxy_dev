@@ -40,8 +40,9 @@
 #include <types/backend.h>
 #include <types/counters.h>
 #include <types/freq_ctr.h>
+#include <types/listener.h>
 #include <types/log.h>
-#include <types/protocols.h>
+#include <types/obj_type.h>
 #include <types/proto_http.h>
 #include <types/sample.h>
 #include <types/session.h>
@@ -200,11 +201,11 @@ struct error_snapshot {
 };
 
 struct proxy {
-	struct listener *listen;		/* the listen addresses and sockets */
-	struct in_addr mon_net, mon_mask;	/* don't forward connections from this net (network order) FIXME: should support IPv6 */
+	enum obj_type obj_type;                 /* object type == OBJ_TYPE_PROXY */
 	int state;				/* proxy state */
 	int options;				/* PR_O_REDISP, PR_O_TRANSP, ... */
 	int options2;				/* PR_O2_* */
+	struct in_addr mon_net, mon_mask;	/* don't forward connections from this net (network order) FIXME: should support IPv6 */
 	unsigned int ck_opts;			/* PR_CK_* (cookie options) */
 	unsigned int fe_req_ana, be_req_ana;	/* bitmap of common request protocol analysers for the frontend and backend */
 	unsigned int fe_rsp_ana, be_rsp_ana;	/* bitmap of common response protocol analysers for the frontend and backend */
@@ -326,7 +327,7 @@ struct proxy {
 	struct list listener_queue;		/* list of the temporarily limited listeners because of lack of a proxy resource */
 	struct stktable table;			/* table for storing sticking sessions */
 
-	struct task *task;			/* the associated task, mandatory to manage rate limiting, stopping and resource shortage */
+	struct task *task;			/* the associated task, mandatory to manage rate limiting, stopping and resource shortage, NULL if disabled */
 	int grace;				/* grace time after stop request */
 	char *check_req;			/* HTTP or SSL request to use for PR_O_HTTP_CHK|PR_O_SSL3_CHK */
 	int check_len;				/* Length of the HTTP or SSL3 request */
@@ -355,14 +356,16 @@ struct proxy {
 	char *logformat_string;			/* log format string */
 	char *uniqueid_format_string;		/* unique-id format string */
 	struct {
-		const char *file;		/* file where the section appears */
+		char *file;			/* file where the section appears */
 		int line;			/* line where the section appears */
 		struct eb32_node id;		/* place in the tree of used IDs */
 		struct eb_root used_listener_id;/* list of listener IDs in use */
 		struct eb_root used_server_id;	/* list of server IDs in use */
-		struct list ssl_bind;		/* list of SSL bind settings */
+		struct list bind;		/* list of bind settings */
+		struct list listeners;		/* list of listeners belonging to this frontend */
 	} conf;					/* config information */
 	void *parent;				/* parent of the proxy when applicable */
+	struct comp *comp;			/* http compression */
 };
 
 struct switching_rule {

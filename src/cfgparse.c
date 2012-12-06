@@ -23,8 +23,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <netinet/tcp.h>
-
 #include <common/cfgparse.h>
 #include <common/chunk.h>
 #include <common/config.h>
@@ -35,7 +33,9 @@
 #include <common/uri_auth.h>
 
 #include <types/capture.h>
+#include <types/compression.h>
 #include <types/global.h>
+#include <types/obj_type.h>
 #include <types/peers.h>
 
 #include <proto/acl.h>
@@ -43,6 +43,7 @@
 #include <proto/backend.h>
 #include <proto/channel.h>
 #include <proto/checks.h>
+#include <proto/compression.h>
 #include <proto/dumpstats.h>
 #include <proto/frontend.h>
 #include <proto/hdr_idx.h>
@@ -51,9 +52,10 @@
 #include <proto/lb_fwlc.h>
 #include <proto/lb_fwrr.h>
 #include <proto/lb_map.h>
+#include <proto/listener.h>
 #include <proto/log.h>
 #include <proto/port_range.h>
-#include <proto/protocols.h>
+#include <proto/protocol.h>
 #include <proto/proto_tcp.h>
 #include <proto/proto_uxst.h>
 #include <proto/proto_http.h>
@@ -191,9 +193,11 @@ static struct cfg_kw_list cfg_keywords = {
  *  - <port> is a numerical port from 1 to 65535 ;
  *  - <end> indicates to use the range from <port> to <end> instead (inclusive).
  * This can be repeated as many times as necessary, separated by a coma.
- * Function returns 1 for success or 0 if error.
+ * Function returns 1 for success or 0 if error. In case of errors, if <err> is
+ * not NULL, it must be a valid pointer to either NULL or a freeable area that
+ * will be replaced with an error message.
  */
-static int str2listener(char *str, struct proxy *curproxy, const char *file, int line)
+int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf, const char *file, int line, char **err)
 {
 	struct listener *l;
 	char *next, *dupstr;
@@ -217,8 +221,7 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 			int max_path_len = (sizeof(((struct sockaddr_un *)&ss)->sun_path) - 1) - (prefix_path_len + 1 + 5 + 1 + 3);
 
 			if (strlen(str) > max_path_len) {
-                                Alert("parsing [%s:%d] : socket path '%s' too long (max %d)\n",
-				      file, line, str, max_path_len);
+				memprintf(err, "socket path '%s' too long (max %d)\n", str, max_path_len);
 				goto fail;
 			}
 
@@ -238,14 +241,12 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 
 			ss2 = str2sa_range(str, &port, &end);
 			if (!ss2) {
-				Alert("parsing [%s:%d] : invalid listening address: '%s'\n",
-				      file, line, str);
+				memprintf(err, "invalid listening address: '%s'\n", str);
 				goto fail;
 			}
 
 			if (!port) {
-				Alert("parsing [%s:%d] : missing port number: '%s'\n",
-				      file, line, str);
+				memprintf(err, "missing port number: '%s'\n", str);
 				goto fail;
 			}
 
@@ -253,26 +254,27 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 			ss = *ss2;
 
 			if (port < 1 || port > 65535) {
-				Alert("parsing [%s:%d] : invalid port '%d' specified for address '%s'.\n",
-				      file, line, port, str);
+				memprintf(err, "invalid port '%d' specified for address '%s'.\n", port, str);
 				goto fail;
 			}
 
 			if (end < 1 || end > 65535) {
-				Alert("parsing [%s:%d] : invalid port '%d' specified for address '%s'.\n",
-				      file, line, end, str);
+				memprintf(err, "invalid port '%d' specified for address '%s'.\n", end, str);
 				goto fail;
 			}
 		}
 
 		for (; port <= end; port++) {
 			l = (struct listener *)calloc(1, sizeof(struct listener));
-			l->next = curproxy->listen;
-			curproxy->listen = l;
+			l->obj_type = OBJ_TYPE_LISTENER;
+			LIST_ADDQ(&curproxy->conf.listeners, &l->by_fe);
+			LIST_ADDQ(&bind_conf->listeners, &l->by_bind);
+			l->frontend = curproxy;
+			l->bind_conf = bind_conf;
 
 			l->fd = -1;
 			l->addr = ss;
-			l->data = &raw_sock;
+			l->xprt = &raw_sock;
 			l->state = LI_INIT;
 
 			if (ss.ss_family == AF_INET) {
@@ -284,8 +286,6 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 				tcpv6_add_listener(l);
 			}
 			else {
-				l->perm.ux.gid = l->perm.ux.uid = -1;
-				l->perm.ux.mode = 0;
 				uxst_add_listener(l);
 			}
 
@@ -469,6 +469,44 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		/* no option, nothing special to do */
 		goto out;
 	}
+	else if (!strcmp(args[0], "ca-base")) {
+#ifdef USE_OPENSSL
+		if (global.ca_base != NULL) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a directory path as an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.ca_base = strdup(args[1]);
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "crt-base")) {
+#ifdef USE_OPENSSL
+		if (global.crt_base != NULL) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a directory path as an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.crt_base = strdup(args[1]);
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
 	else if (!strcmp(args[0], "daemon")) {
 		global.mode |= MODE_DAEMON;
 	}
@@ -477,9 +515,6 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	}
 	else if (!strcmp(args[0], "noepoll")) {
 		global.tune.options &= ~GTUNE_USE_EPOLL;
-	}
-	else if (!strcmp(args[0], "nosepoll")) {
-		global.tune.options &= ~GTUNE_USE_SEPOLL;
 	}
 	else if (!strcmp(args[0], "nokqueue")) {
 		global.tune.options &= ~GTUNE_USE_KQUEUE;
@@ -528,13 +563,33 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		global.tune.chksize = atol(args[1]);
 	}
 #ifdef USE_OPENSSL
-	else if (!strcmp(args[0], "tune.sslcachesize")) {
+	else if (!strcmp(args[0], "tune.ssl.cachesize")) {
 		if (*(args[1]) == 0) {
 			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 		global.tune.sslcachesize = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "tune.ssl.lifetime")) {
+		unsigned int ssllifetime;
+		const char *res;
+
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects ssl sessions <lifetime> in seconds as argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		res = parse_time_err(args[1], &ssllifetime, TIME_UNIT_S);
+		if (res) {
+			Alert("parsing [%s:%d]: unexpected character '%c' in argument to <%s>.\n",
+			      file, linenum, *res, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		global.tune.ssllifetime = ssllifetime;
 	}
 #endif
 	else if (!strcmp(args[0], "tune.bufsize")) {
@@ -546,8 +601,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		global.tune.bufsize = atol(args[1]);
 		if (global.tune.maxrewrite >= global.tune.bufsize / 2)
 			global.tune.maxrewrite = global.tune.bufsize / 2;
-		trashlen = global.tune.bufsize;
-		trash = realloc(trash, trashlen);
+		chunk_init(&trash, realloc(trash.str, global.tune.bufsize), global.tune.bufsize);
 	}
 	else if (!strcmp(args[0], "tune.maxrewrite")) {
 		if (*(args[1]) == 0) {
@@ -619,6 +673,14 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.tune.pipesize = atol(args[1]);
 	}
+	else if (!strcmp(args[0], "tune.http.cookielen")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.tune.cookie_len = atol(args[1]) + 1;
+	}
 	else if (!strcmp(args[0], "tune.http.maxhdr")) {
 		if (*(args[1]) == 0) {
 			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
@@ -626,6 +688,66 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.tune.max_http_hdr = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "tune.zlib.memlevel")) {
+#ifdef USE_ZLIB
+		if (*args[1]) {
+			global.tune.zlibmemlevel = atoi(args[1]);
+			if (global.tune.zlibmemlevel < 1 || global.tune.zlibmemlevel > 9) {
+				Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		} else {
+			Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "tune.zlib.windowsize")) {
+#ifdef USE_ZLIB
+		if (*args[1]) {
+			global.tune.zlibwindowsize = atoi(args[1]);
+			if (global.tune.zlibwindowsize < 8 || global.tune.zlibwindowsize > 15) {
+				Alert("parsing [%s:%d] : '%s' expects a numeric value between 8 and 15\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		} else {
+			Alert("parsing [%s:%d] : '%s' expects a numeric value between 8 and 15\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "tune.comp.maxlevel")) {
+		if (*args[1]) {
+			global.tune.comp_maxlevel = atoi(args[1]);
+			if (global.tune.comp_maxlevel < 1 || global.tune.comp_maxlevel > 9) {
+				Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		} else {
+			Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 	}
 	else if (!strcmp(args[0], "uid")) {
 		if (global.uid != 0) {
@@ -690,11 +812,6 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	}
 	/* end of user/group name handling*/
 	else if (!strcmp(args[0], "nbproc")) {
-		if (global.nbproc != 0) {
-			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT;
-			goto out;
-		}
 		if (*(args[1]) == 0) {
 			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -731,11 +848,9 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.maxsslconn = atol(args[1]);
 #else
-		if (*(args[1]) == 0) {
-			Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
 #endif
 	}
 	else if (!strcmp(args[0], "maxconnrate")) {
@@ -751,6 +866,14 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.cps_lim = atol(args[1]);
 	}
+	else if (!strcmp(args[0], "maxcomprate")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument in kb/s.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.comp_rate_lim = atoi(args[1]) * 1024;
+	}
 	else if (!strcmp(args[0], "maxpipes")) {
 		if (global.maxpipes != 0) {
 			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
@@ -764,6 +887,28 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.maxpipes = atol(args[1]);
 	}
+	else if (!strcmp(args[0], "maxzlibmem")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.maxzlibmem = atol(args[1]) * 1024L * 1024L;
+	}
+	else if (!strcmp(args[0], "maxcompcpuusage")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument between 0 and 100.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		compress_min_idle = 100 - atoi(args[1]);
+		if (compress_min_idle < 0 || compress_min_idle > 100) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument between 0 and 100.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+}
+
 	else if (!strcmp(args[0], "ulimit-n")) {
 		if (global.rlimit_nofile != 0) {
 			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
@@ -1057,6 +1202,75 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 	}
+	else if (strcmp(args[0], "cpu-map") == 0) {  /* map a process list to a CPU set */
+#ifdef USE_CPU_AFFINITY
+		int cur_arg, i;
+		unsigned int proc = 0;
+		unsigned long cpus = 0;
+
+		if (strcmp(args[1], "all") == 0)
+			proc = 0xFFFFFFFF;
+		else if (strcmp(args[1], "odd") == 0)
+			proc = 0x55555555;
+		else if (strcmp(args[1], "even") == 0)
+			proc = 0xAAAAAAAA;
+		else {
+			proc = atoi(args[1]);
+			if (proc >= 1 && proc <= 32)
+				proc = 1 << (proc - 1);
+		}
+
+		if (!proc || !*args[2]) {
+			Alert("parsing [%s:%d]: %s expects a process number including 'all', 'odd', 'even', or a number from 1 to 32, followed by a list of CPU ranges with numbers from 0 to 31.\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		cur_arg = 2;
+		while (*args[cur_arg]) {
+			unsigned int low, high;
+
+			if (isdigit((int)*args[cur_arg])) {
+				char *dash = strchr(args[cur_arg], '-');
+
+				low = high = str2uic(args[cur_arg]);
+				if (dash)
+					high = str2uic(dash + 1);
+
+				if (high < low) {
+					unsigned int swap = low;
+					low = high;
+					high = swap;
+				}
+
+				if (low < 0 || high >= sizeof(long) * 8) {
+					Alert("parsing [%s:%d]: %s supports CPU numbers from 0 to %d.\n",
+					      file, linenum, args[0], (int)(sizeof(long) * 8 - 1));
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				while (low <= high)
+					cpus |= 1UL << low++;
+			}
+			else {
+				Alert("parsing [%s:%d]: %s : '%s' is not a CPU range.\n",
+				      file, linenum, args[0], args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			cur_arg++;
+		}
+		for (i = 0; i < 32; i++)
+			if (proc & (1 << i))
+				global.cpu_map[i] = cpus;
+#else
+		Alert("parsing [%s:%d] : '%s' is not enabled, please check build options for USE_CPU_AFFINITY.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
 	else {
 		struct cfg_kw_list *kwl;
 		int index;
@@ -1067,10 +1281,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 				if (kwl->kw[index].section != CFG_GLOBAL)
 					continue;
 				if (strcmp(kwl->kw[index].kw, args[0]) == 0) {
-					/* prepare error message just in case */
-					snprintf(trash, trashlen,
-						 "error near '%s' in '%s' section", args[0], "global");
-					rc = kwl->kw[index].parse(args, CFG_GLOBAL, NULL, NULL, &errmsg);
+					rc = kwl->kw[index].parse(args, CFG_GLOBAL, NULL, NULL, file, linenum, &errmsg);
 					if (rc < 0) {
 						Alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
 						err_code |= ERR_ALERT | ERR_FATAL;
@@ -1107,7 +1318,7 @@ void init_default_instance()
 	defproxy.defsrv.downinter = 0;
 	defproxy.defsrv.rise = DEF_RISETIME;
 	defproxy.defsrv.fall = DEF_FALLTIME;
-	defproxy.defsrv.check_port = 0;
+	defproxy.defsrv.check.port = 0;
 	defproxy.defsrv.maxqueue = 0;
 	defproxy.defsrv.minconn = 0;
 	defproxy.defsrv.maxconn = 0;
@@ -1213,6 +1424,8 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	static struct peers *curpeers = NULL;
 	struct peer *newpeer = NULL;
 	const char *err;
+	struct bind_conf *bind_conf;
+	struct listener *l;
 	int err_code = 0;
 
 	if (strcmp(args[0], "peers") == 0) { /* new peers section */
@@ -1244,7 +1457,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 
 		curpeers->next = peers;
 		peers = curpeers;
-		curpeers->conf.file = file;
+		curpeers->conf.file = strdup(file);
 		curpeers->conf.line = linenum;
 		curpeers->last_change = now.tv_sec;
 		curpeers->id = strdup(args[1]);
@@ -1253,6 +1466,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		char *rport, *raddr;
 		short realport = 0;
 		struct sockaddr_storage *sk;
+		char *err_msg = NULL;
 
 		if (!*args[2]) {
 			Alert("parsing [%s:%d] : '%s' expects <name> and <addr>[:<port>] as arguments.\n",
@@ -1280,7 +1494,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		newpeer->next = curpeers->remote;
 		curpeers->remote = newpeer;
 		newpeer->peers = curpeers;
-		newpeer->conf.file = file;
+		newpeer->conf.file = strdup(file);
 		newpeer->conf.line = linenum;
 
 		newpeer->last_change = now.tv_sec;
@@ -1307,10 +1521,10 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		}
 		newpeer->addr = *sk;
 		newpeer->proto = protocol_by_family(newpeer->addr.ss_family);
-		newpeer->data  = &raw_sock;
+		newpeer->xprt  = &raw_sock;
 		newpeer->sock_init_arg = NULL;
 
-		if (!sk) {
+		if (!newpeer->proto) {
 			Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
 			      file, linenum, newpeer->addr.ss_family, args[2]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -1341,19 +1555,32 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				curpeers->peers_fe->timeout.connect = 5000;
 				curpeers->peers_fe->accept = peer_accept;
 				curpeers->peers_fe->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON | PR_O2_SMARTACC;
-				if (!str2listener(args[2], curpeers->peers_fe, file, linenum)) {
+
+				bind_conf = bind_conf_alloc(&curpeers->peers_fe->conf.bind, file, linenum, args[2]);
+
+				if (!str2listener(args[2], curpeers->peers_fe, bind_conf, file, linenum, &err_msg)) {
+					if (err_msg && *err_msg) {
+						indent_msg(&err_msg, 2);
+						Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err_msg);
+					}
+					else
+						Alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
+						      file, linenum, args[0], args[1], args[2]);
+					free(err_msg);
 					err_code |= ERR_FATAL;
 					goto out;
 				}
-				curpeers->peers_fe->listen->maxconn = ((struct proxy *)curpeers->peers_fe)->maxconn;
-				curpeers->peers_fe->listen->backlog = ((struct proxy *)curpeers->peers_fe)->backlog;
-				curpeers->peers_fe->listen->timeout = &((struct proxy *)curpeers->peers_fe)->timeout.client;
-				curpeers->peers_fe->listen->accept = session_accept;
-				curpeers->peers_fe->listen->frontend =  ((struct proxy *)curpeers->peers_fe);
-				curpeers->peers_fe->listen->handler = process_session;
-				curpeers->peers_fe->listen->analysers |=  ((struct proxy *)curpeers->peers_fe)->fe_req_ana;
-				curpeers->peers_fe->listen->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
-				global.maxsock += curpeers->peers_fe->listen->maxconn;
+
+				list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+					l->maxconn = ((struct proxy *)curpeers->peers_fe)->maxconn;
+					l->backlog = ((struct proxy *)curpeers->peers_fe)->backlog;
+					l->timeout = &((struct proxy *)curpeers->peers_fe)->timeout.client;
+					l->accept = session_accept;
+					l->handler = process_session;
+					l->analysers |=  ((struct proxy *)curpeers->peers_fe)->fe_req_ana;
+					l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
+					global.maxsock += l->maxconn;
+				}
 			}
 		}
 	} /* neither "peer" nor "peers" */
@@ -1379,7 +1606,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	struct acl_cond *cond = NULL;
 	struct logsrv *tmplogsrv;
 	char *errmsg = NULL;
-	struct ssl_conf *ssl_conf;
+	struct bind_conf *bind_conf;
 
 	if (!strcmp(args[0], "listen"))
 		rc = PR_CAP_LISTEN;
@@ -1439,7 +1666,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		init_new_proxy(curproxy);
 		curproxy->next = proxy;
 		proxy = curproxy;
-		curproxy->conf.file = file;
+		curproxy->conf.file = strdup(file);
 		curproxy->conf.line = linenum;
 		curproxy->last_change = now.tv_sec;
 		curproxy->id = strdup(args[1]);
@@ -1447,16 +1674,25 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		/* parse the listener address if any */
 		if ((curproxy->cap & PR_CAP_FE) && *args[2]) {
-			struct listener *new, *last = curproxy->listen;
-			if (!str2listener(args[2], curproxy, file, linenum)) {
+			struct listener *l;
+			char *err_msg = NULL;
+
+			bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[2]);
+
+			if (!str2listener(args[2], curproxy, bind_conf, file, linenum, &err_msg)) {
+				if (err_msg && *err_msg) {
+					indent_msg(&err_msg, 2);
+					Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err_msg);
+				}
+				else
+					Alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address '%s'.\n",
+					      file, linenum, args[0], args[1], args[2]);
+				free(err_msg);
 				err_code |= ERR_FATAL;
 				goto out;
 			}
-			new = curproxy->listen;
-			while (new != last) {
-				new->conf.file = file;
-				new->conf.line = linenum;
-				new = new->next;
+
+			list_for_each_entry(l, &bind_conf->listeners, by_bind) {
 				global.maxsock++;
 			}
 		}
@@ -1614,6 +1850,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		if (defproxy.header_unique_id)
 			curproxy->header_unique_id = strdup(defproxy.header_unique_id);
 
+		/* default compression options */
+		if (defproxy.comp != NULL) {
+			curproxy->comp = calloc(1, sizeof(struct comp));
+			curproxy->comp->algos = defproxy.comp->algos;
+			curproxy->comp->types = defproxy.comp->types;
+		}
+
 		curproxy->grace  = defproxy.grace;
 		curproxy->conf.used_listener_id = EB_ROOT;
 		curproxy->conf.used_server_id = EB_ROOT;
@@ -1669,8 +1912,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 	/* Now let's parse the proxy-specific keywords */
 	if (!strcmp(args[0], "bind")) {  /* new listen addresses */
-		struct listener *new_listen, *last_listen;
+		struct listener *l;
 		int cur_arg;
+		char *err_msg = NULL;
 
 		if (curproxy == &defproxy) {
 			Alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
@@ -1687,496 +1931,84 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		last_listen = curproxy->listen;
-		ssl_conf = NULL;
+		bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[1]);
+		memcpy(&bind_conf->ux, &global.unix_bind.ux, sizeof(global.unix_bind.ux));
 
 		/* NOTE: the following line might create several listeners if there
 		 * are comma-separated IPs or port ranges. So all further processing
 		 * will have to be applied to all listeners created after last_listen.
 		 */
-		if (!str2listener(args[1], curproxy, file, linenum)) {
+		if (!str2listener(args[1], curproxy, bind_conf, file, linenum, &err_msg)) {
+			if (err_msg && *err_msg) {
+				indent_msg(&err_msg, 2);
+				Alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], err_msg);
+			}
+			else
+				Alert("parsing [%s:%d] : '%s' : error encountered while parsing listening address '%s'.\n",
+				      file, linenum, args[0], args[1]);
+			free(err_msg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
-		new_listen = curproxy->listen;
-		while (new_listen != last_listen) {
-			new_listen->conf.file = file;
-			new_listen->conf.line = linenum;
-			new_listen = new_listen->next;
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			/* Set default global rights and owner for unix bind  */
 			global.maxsock++;
 		}
 
-		/* Set default global rights and owner for unix bind  */
-		if (curproxy->listen->addr.ss_family == AF_UNIX) {
-			memcpy(&(curproxy->listen->perm.ux), &(global.unix_bind.ux), sizeof(global.unix_bind.ux));
-		}
 		cur_arg = 2;
 		while (*(args[cur_arg])) {
-			if (!strcmp(args[cur_arg], "interface")) { /* specifically bind to this interface */
-#ifdef SO_BINDTODEVICE
-				struct listener *l;
+			static int bind_dumped;
+			struct bind_kw *kw;
+			char *err;
 
-				if (curproxy->listen->addr.ss_family == AF_UNIX) {
-					Alert("parsing [%s:%d] : '%s' : '%s' option not supported on unix sockets.\n",
-					      file, linenum, args[0], args[cur_arg]);
+			kw = bind_find_kw(args[cur_arg]);
+			if (kw) {
+				char *err = NULL;
+				int code;
+
+				if (!kw->parse) {
+					Alert("parsing [%s:%d] : '%s %s' : '%s' option is not implemented in this version (check build options).\n",
+					      file, linenum, args[0], args[1], args[cur_arg]);
+					cur_arg += 1 + kw->skip ;
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
 
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : missing interface name.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->interface = strdup(args[cur_arg + 1]);
+				code = kw->parse(args, cur_arg, curproxy, bind_conf, &err);
+				err_code |= code;
 
-				global.last_checks |= LSTCHK_NETADM;
-
-				cur_arg += 2;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-			if (!strcmp(args[cur_arg], "mss")) { /* set MSS of listening socket */
-#ifdef TCP_MAXSEG
-				struct listener *l;
-				int mss;
-
-				if (curproxy->listen->addr.ss_family == AF_UNIX) {
-					Alert("parsing [%s:%d] : '%s' : '%s' option not supported on unix sockets.\n",
-					      file, linenum, args[0], args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : missing MSS value.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				mss = atoi(args[cur_arg + 1]);
-				if (!mss || abs(mss) > 65535) {
-					Alert("parsing [%s:%d]: %s expects an MSS with and absolute value between 1 and 65535.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->maxseg = mss;
-
-				cur_arg += 2;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "defer-accept")) { /* wait for some data for 1 second max before doing accept */
-#ifdef TCP_DEFER_ACCEPT
-				struct listener *l;
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->options |= LI_O_DEF_ACCEPT;
-
-				cur_arg ++;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "transparent")) { /* transparently bind to these addresses */
-#ifdef CONFIG_HAP_LINUX_TPROXY
-				struct listener *l;
-
-				if (curproxy->listen->addr.ss_family == AF_UNIX) {
-					Alert("parsing [%s:%d] : '%s' : '%s' option not supported on unix sockets.\n",
-					      file, linenum, args[0], args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->options |= LI_O_FOREIGN;
-
-				cur_arg ++;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "maxconn")) {
-				struct listener *l;
-				int val;
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : missing maxconn value.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				val = atol(args[cur_arg + 1]);
-				if (val <= 0) {
-					Alert("parsing [%s:%d] : '%s' : invalid maxconn value %d, must be > 0.\n",
-					      file, linenum, args[0], val);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->maxconn = val;
-
-				cur_arg += 2;
-				continue;
-			}
-
-			if (!strcmp(args[cur_arg], "backlog")) {
-				struct listener *l;
-				int val;
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : missing backlog value.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				val = atol(args[cur_arg + 1]);
-				if (val <= 0) {
-					Alert("parsing [%s:%d] : '%s' : invalid backlog value %d, must be > 0.\n",
-					      file, linenum, args[0], val);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->backlog = val;
-
-				cur_arg += 2;
-				continue;
-			}
-
-			if (!strcmp(args[cur_arg], "nice")) {
-				struct listener *l;
-				int val;
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : missing nice value.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				val = atol(args[cur_arg + 1]);
-				if (val < -1024 || val > 1024) {
-					Alert("parsing [%s:%d] : '%s' : invalid nice value %d, allowed range is -1024..1024.\n",
-					      file, linenum, args[0], val);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->nice = val;
-
-				cur_arg += 2;
-				continue;
-			}
-
-			if (!strcmp(args[cur_arg], "ssl")) { /* use ssl */
-#ifdef USE_OPENSSL
-				struct listener *l;
-
-				if (!ssl_conf)
-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
-
-				for (l = curproxy->listen; l != last_listen; l = l->next) {
-					if (!l->ssl_conf) {
-						l->ssl_conf = ssl_conf;
-						ssl_conf->ref_cnt++;
+				if (code) {
+					if (err && *err) {
+						indent_msg(&err, 2);
+						Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
+					}
+					else
+						Alert("parsing [%s:%d] : '%s %s' : error encountered while processing '%s'.\n",
+						      file, linenum, args[0], args[1], args[cur_arg]);
+					if (code & ERR_FATAL) {
+						free(err);
+						cur_arg += 1 + kw->skip;
+						goto out;
 					}
 				}
-
-				cur_arg += 1;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "crt")) { /* use ssl certificate */
-#ifdef USE_OPENSSL
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : missing certificate.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				if (!ssl_conf)
-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
-
-				if (ssl_sock_load_cert(args[cur_arg + 1], ssl_conf, curproxy) > 0) {
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				cur_arg += 2;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "ciphers")) { /* set cipher suite */
-#ifdef USE_OPENSSL
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : missing cipher suite.\n",
-					      file, linenum, args[0]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				if (!ssl_conf)
-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
-				ssl_conf->ciphers = strdup(args[cur_arg + 1]);
-
-				cur_arg += 2;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "nosslv3")) { /* disable SSLv3 */
-#ifdef USE_OPENSSL
-				if (!ssl_conf)
-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
-				ssl_conf->nosslv3 = 1;
-
-				cur_arg += 1;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "notlsv1")) { /* disable TLSv1 */
-#ifdef USE_OPENSSL
-				if (!ssl_conf)
-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
-				ssl_conf->notlsv1 = 1;
-
-				cur_arg += 1;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "prefer-server-ciphers")) { /* Prefert server ciphers */
-#if defined (USE_OPENSSL) && defined(SSL_OP_CIPHER_SERVER_PREFERENCE)
-				if (!ssl_conf)
-					ssl_conf = ssl_conf_alloc(&curproxy->conf.ssl_bind, file, linenum, args[1]);
-				ssl_conf->prefer_server_ciphers = 1;
-
-				cur_arg += 1;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-
-			if (!strcmp(args[cur_arg], "accept-proxy")) { /* expect a 'PROXY' line first */
-				struct listener *l;
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->options |= LI_O_ACC_PROXY;
-
-				cur_arg ++;
+				free(err);
+				cur_arg += 1 + kw->skip;
 				continue;
 			}
 
-			if (!strcmp(args[cur_arg], "name")) {
-				struct listener *l;
-
-				for (l = curproxy->listen; l != last_listen; l = l->next)
-					l->name = strdup(args[cur_arg + 1]);
-
-				cur_arg += 2;
-				continue;
+			err = NULL;
+			if (!bind_dumped) {
+				bind_dump_kws(&err);
+				indent_msg(&err, 4);
+				bind_dumped = 1;
 			}
 
-			if (!strcmp(args[cur_arg], "id")) {
-				struct eb32_node *node;
-				struct listener *l;
+			Alert("parsing [%s:%d] : '%s %s' unknown keyword '%s'.%s%s\n",
+			      file, linenum, args[0], args[1], args[cur_arg],
+			      err ? " Registered keywords :" : "", err ? err : "");
+			free(err);
 
-				if (curproxy->listen->next != last_listen) {
-					Alert("parsing [%s:%d]: '%s' can be only used with a single socket.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d]: '%s' expects an integer argument.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				curproxy->listen->luid = atol(args[cur_arg + 1]);
-				curproxy->listen->conf.id.key = curproxy->listen->luid;
-
-				if (curproxy->listen->luid <= 0) {
-					Alert("parsing [%s:%d]: custom id has to be > 0\n",
-						file, linenum);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				node = eb32_lookup(&curproxy->conf.used_listener_id, curproxy->listen->luid);
-				if (node) {
-					l = container_of(node, struct listener, conf.id);
-					Alert("parsing [%s:%d]: custom id %d for socket '%s' already used at %s:%d.\n",
-					      file, linenum, l->luid, args[1], l->conf.file, l->conf.line);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				eb32_insert(&curproxy->conf.used_listener_id, &curproxy->listen->conf.id);
-
-				cur_arg += 2;
-				continue;
-			}
-
-			if (!strcmp(args[cur_arg], "mode")) {
-
-				if (curproxy->listen->addr.ss_family != AF_UNIX) {
-					Alert("parsing [%s:%d] : '%s' : '%s' option only supported on unix sockets.\n",
-					      file, linenum, args[0], args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				curproxy->listen->perm.ux.mode = strtol(args[cur_arg + 1], NULL, 8);
-
-				cur_arg += 2;
-				continue;
-			}
-
-			if (!strcmp(args[cur_arg], "uid")) {
-
-                                if (curproxy->listen->addr.ss_family != AF_UNIX) {
-                                        Alert("parsing [%s:%d] : '%s' : '%s' option only supported on unix sockets.\n",
-                                                file, linenum, args[0], args[cur_arg]);
-                                        err_code |= ERR_ALERT | ERR_FATAL;
-                                        goto out;
-                                }
-
-                                curproxy->listen->perm.ux.uid = atol(args[cur_arg + 1 ]);
-                                cur_arg += 2;
-                                continue;
-                        }
-
-			if (!strcmp(args[cur_arg], "gid")) {
-
-                                if (curproxy->listen->addr.ss_family != AF_UNIX) {
-                                        Alert("parsing [%s:%d] : '%s' : '%s' option only supported on unix sockets.\n",
-                                                file, linenum, args[0], args[cur_arg]);
-                                        err_code |= ERR_ALERT | ERR_FATAL;
-                                        goto out;
-                                }
-
-                                curproxy->listen->perm.ux.gid = atol(args[cur_arg + 1 ]);
-                                cur_arg += 2;
-                                continue;
-                        }
-
-			if (!strcmp(args[cur_arg], "user")) {
-				struct passwd *user;
-
-				if (curproxy->listen->addr.ss_family != AF_UNIX) {
-					Alert("parsing [%s:%d] : '%s' : '%s' option only supported on unix sockets.\n",
-						file, linenum, args[0], args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				user = getpwnam(args[cur_arg + 1]);
-				if (!user) {
-					Alert("parsing [%s:%d] : '%s' : '%s' unknown user.\n",
-						file, linenum, args[0], args[cur_arg + 1 ]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				curproxy->listen->perm.ux.uid = user->pw_uid;
-				cur_arg += 2;
-				continue;
-                        }
-
-			if (!strcmp(args[cur_arg], "group")) {
-				struct group *group;
-
-				if (curproxy->listen->addr.ss_family != AF_UNIX) {
-					Alert("parsing [%s:%d] : '%s' : '%s' option only supported on unix sockets.\n",
-						file, linenum, args[0], args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				group = getgrnam(args[cur_arg + 1]);
-				if (!group) {
-					Alert("parsing [%s:%d] : '%s' : '%s' unknown group.\n",
-						file, linenum, args[0], args[cur_arg + 1 ]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				curproxy->listen->perm.ux.gid = group->gr_gid;
-				cur_arg += 2;
-				continue;
-                        }
-
-			Alert("parsing [%s:%d] : '%s' only supports the 'transparent', 'accept-proxy', 'defer-accept', 'name', 'id', 'mss', 'mode', 'uid', 'gid', 'user', 'group' and 'interface' options.\n",
-			      file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -2302,7 +2134,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		unsigned int set = 0;
 
 		while (*args[cur_arg]) {
-			int u;
+			unsigned int low, high;
+
 			if (strcmp(args[cur_arg], "all") == 0) {
 				set = 0;
 				break;
@@ -2313,20 +2146,39 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			else if (strcmp(args[cur_arg], "even") == 0) {
 				set |= 0xAAAAAAAA;
 			}
-			else {
-				u = str2uic(args[cur_arg]);
-				if (u < 1 || u > 32) {
-					Alert("parsing [%s:%d]: %s expects 'all', 'odd', 'even', or process numbers from 1 to 32.\n",
+			else if (isdigit((int)*args[cur_arg])) {
+				char *dash = strchr(args[cur_arg], '-');
+
+				low = high = str2uic(args[cur_arg]);
+				if (dash)
+					high = str2uic(dash + 1);
+
+				if (high < low) {
+					unsigned int swap = low;
+					low = high;
+					high = swap;
+				}
+
+				if (low < 1 || high > 32) {
+					Alert("parsing [%s:%d]: %s supports process numbers from 1 to 32.\n",
 					      file, linenum, args[0]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
-				if (u > global.nbproc) {
-					Warning("parsing [%s:%d]: %s references process number higher than global.nbproc.\n",
-						file, linenum, args[0]);
+
+				if (high > global.nbproc) {
+					Warning("parsing [%s:%d]: %s references process number %d which is higher than global.nbproc (%d).\n",
+						file, linenum, args[0], high, global.nbproc);
 					err_code |= ERR_WARN;
 				}
-				set |= 1 << (u - 1);
+				while (low <= high)
+					set |= 1 << (low++ - 1);
+			}
+			else {
+				Alert("parsing [%s:%d]: %s expects 'all', 'odd', 'even', or a list of process ranges with numbers from 1 to 32.\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
 			}
 			cur_arg++;
 		}
@@ -2651,12 +2503,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curproxy->capture_name = strdup(args[2]);
 			curproxy->capture_namelen = strlen(curproxy->capture_name);
 			curproxy->capture_len = atol(args[4]);
-			if (curproxy->capture_len >= CAPTURE_LEN) {
-				Warning("parsing [%s:%d] : truncating capture length to %d bytes.\n",
-					file, linenum, CAPTURE_LEN - 1);
-				err_code |= ERR_WARN;
-				curproxy->capture_len = CAPTURE_LEN - 1;
-			}
 			curproxy->to_log |= LW_COOKIE;
 		}
 		else if (!strcmp(args[1], "request") && !strcmp(args[2], "header")) {
@@ -2837,6 +2683,18 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				cur_arg++;
 				destination = args[cur_arg];
 			}
+			else if (!strcmp(args[cur_arg], "scheme")) {
+				if (!*args[cur_arg + 1]) {
+					Alert("parsing [%s:%d] : '%s': missing argument for '%s'.\n",
+					      file, linenum, args[0], args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				type = REDIRECT_TYPE_SCHEME;
+				cur_arg++;
+				destination = args[cur_arg];
+			}
 			else if (!strcmp(args[cur_arg], "set-cookie")) {
 				if (!*args[cur_arg + 1]) {
 					Alert("parsing [%s:%d] : '%s': missing argument for '%s'.\n",
@@ -2895,7 +2753,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				break;
 			}
 			else {
-				Alert("parsing [%s:%d] : '%s' expects 'code', 'prefix', 'location', 'set-cookie', 'clear-cookie', 'drop-query' or 'append-slash' (was '%s').\n",
+				Alert("parsing [%s:%d] : '%s' expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'clear-cookie', 'drop-query' or 'append-slash' (was '%s').\n",
 				      file, linenum, args[0], args[cur_arg]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
@@ -3262,9 +3120,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		expr = sample_parse_expr(args, &myidx, trash, trashlen);
+		expr = sample_parse_expr(args, &myidx, trash.str, trash.size);
 		if (!expr) {
-			Alert("parsing [%s:%d] : '%s': %s\n", file, linenum, args[0], trash);
+			Alert("parsing [%s:%d] : '%s': %s\n", file, linenum, args[0], trash.str);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -3286,6 +3144,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 		}
+
+		/* check if we need to allocate an hdr_idx struct for HTTP parsing */
+		if (expr->fetch->cap & SMP_CAP_L7)
+			curproxy->acl_requires |= ACL_USE_L7_ANY;
 
 		if (strcmp(args[myidx], "table") == 0) {
 			myidx++;
@@ -4291,9 +4153,10 @@ stats_error_parsing:
 			newsrv->next = curproxy->srv;
 			curproxy->srv = newsrv;
 			newsrv->proxy = curproxy;
-			newsrv->conf.file = file;
+			newsrv->conf.file = strdup(file);
 			newsrv->conf.line = linenum;
 
+			newsrv->obj_type = OBJ_TYPE_SERVER;
 			LIST_INIT(&newsrv->actconns);
 			LIST_INIT(&newsrv->pendconns);
 			do_check = 0;
@@ -4326,10 +4189,10 @@ stats_error_parsing:
 				goto out;
 			}
 			newsrv->addr = *sk;
-			newsrv->proto = protocol_by_family(newsrv->addr.ss_family);
-			newsrv->data  = &raw_sock;
+			newsrv->proto = newsrv->check.proto = protocol_by_family(newsrv->addr.ss_family);
+			newsrv->xprt  = newsrv->check.xprt  = &raw_sock;
 
-			if (!sk) {
+			if (!newsrv->proto) {
 				Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
 				      file, linenum, newsrv->addr.ss_family, args[2]);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -4337,7 +4200,8 @@ stats_error_parsing:
 			}
 			set_host_port(&newsrv->addr, realport);
 
-			newsrv->check_port	= curproxy->defsrv.check_port;
+			newsrv->check.use_ssl	= curproxy->defsrv.check.use_ssl;
+			newsrv->check.port	= curproxy->defsrv.check.port;
 			newsrv->inter		= curproxy->defsrv.inter;
 			newsrv->fastinter	= curproxy->defsrv.fastinter;
 			newsrv->downinter	= curproxy->defsrv.downinter;
@@ -4356,7 +4220,6 @@ stats_error_parsing:
 			newsrv->uweight = newsrv->iweight
 						= curproxy->defsrv.iweight;
 
-			newsrv->curfd = -1;		/* no health-check in progress */
 			newsrv->health = newsrv->rise;	/* up, but will fall down at first failure */
 
 			cur_arg = 3;
@@ -4366,38 +4229,7 @@ stats_error_parsing:
 		}
 
 		while (*args[cur_arg]) {
-			if (!defsrv && !strcmp(args[cur_arg], "id")) {
-				struct eb32_node *node;
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d]: '%s' expects an integer argument.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->puid = atol(args[cur_arg + 1]);
-				newsrv->conf.id.key = newsrv->puid;
-
-				if (newsrv->puid <= 0) {
-					Alert("parsing [%s:%d]: custom id has to be > 0.\n",
-						file, linenum);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				node = eb32_lookup(&curproxy->conf.used_server_id, newsrv->puid);
-				if (node) {
-					struct server *target = container_of(node, struct server, conf.id);
-					Alert("parsing [%s:%d]: server %s reuses same custom id as server %s (declared at %s:%d).\n",
-					      file, linenum, newsrv->id, target->id, target->conf.file, target->conf.line);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				eb32_insert(&curproxy->conf.used_server_id, &newsrv->conf.id);
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "cookie")) {
+			if (!defsrv && !strcmp(args[cur_arg], "cookie")) {
 				newsrv->cookie = strdup(args[cur_arg + 1]);
 				newsrv->cklen = strlen(args[cur_arg + 1]);
 				cur_arg += 2;
@@ -4504,11 +4336,11 @@ stats_error_parsing:
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
-				newsrv->check_addr = *sk;
+				newsrv->check.addr = *sk;
 				cur_arg += 2;
 			}
 			else if (!strcmp(args[cur_arg], "port")) {
-				newsrv->check_port = atol(args[cur_arg + 1]);
+				newsrv->check.port = atol(args[cur_arg + 1]);
 				cur_arg += 2;
 			}
 			else if (!defsrv && !strcmp(args[cur_arg], "backup")) {
@@ -4521,6 +4353,10 @@ stats_error_parsing:
 			}
 			else if (!defsrv && !strcmp(args[cur_arg], "send-proxy")) {
 				newsrv->state |= SRV_SEND_PROXY;
+				cur_arg ++;
+			}
+			else if (!defsrv && !strcmp(args[cur_arg], "check-send-proxy")) {
+				newsrv->check.send_proxy = 1;
 				cur_arg ++;
 			}
 			else if (!strcmp(args[cur_arg], "weight")) {
@@ -4588,59 +4424,6 @@ stats_error_parsing:
 				newsrv->state &= ~SRV_RUNNING;
 				newsrv->health = 0;
 				cur_arg += 1;
-			}
-			else if (!strcmp(args[cur_arg], "ssl")) {
-#ifdef USE_OPENSSL
-				newsrv->use_ssl = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
-			}
-			else if (!strcmp(args[cur_arg], "ciphers")) { /* use this SSL cipher suite */
-#ifdef USE_OPENSSL
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : '%s' : missing cipher suite.\n",
-					      file, linenum, args[0], args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->ssl_ctx.ciphers = strdup(args[cur_arg + 1]);
-
-				cur_arg += 2;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-			else if (!strcmp(args[cur_arg], "nosslv3")) {
-#ifdef USE_OPENSSL
-				newsrv->ssl_ctx.nosslv3 = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
-			}
-			else if (!strcmp(args[cur_arg], "notlsv1")) {
-#ifdef USE_OPENSSL
-				newsrv->ssl_ctx.notlsv1 = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
 			}
 			else if (!defsrv && !strcmp(args[cur_arg], "observe")) {
 				if (!strcmp(args[cur_arg + 1], "none"))
@@ -4816,7 +4599,7 @@ stats_error_parsing:
 								name = end;
 								if (*end == '-')
 									end++;
-								while (isdigit(*end))
+								while (isdigit((int)*end))
 									end++;
 								newsrv->bind_hdr_occ = strl2ic(name, end-name);
 							}
@@ -4886,12 +4669,64 @@ stats_error_parsing:
 				goto out;
 			}
 			else {
-				if (!defsrv)
-					Alert("parsing [%s:%d] : server %s only supports options 'backup', 'cookie', 'redir', 'observer', 'on-error', 'on-marked-down', 'error-limit', 'check', 'disabled', 'track', 'id', 'inter', 'fastinter', 'downinter', 'rise', 'fall', 'addr', 'port', 'source', 'send-proxy', 'minconn', 'maxconn', 'maxqueue', 'slowstart' and 'weight'.\n",
-					      file, linenum, newsrv->id);
-				else
-					Alert("parsing [%s:%d]: default-server only supports options 'on-error', 'error-limit', 'inter', 'fastinter', 'downinter', 'rise', 'fall', 'port', 'minconn', 'maxconn', 'maxqueue', 'slowstart' and 'weight'.\n",
-					      file, linenum);
+				static int srv_dumped;
+				struct srv_kw *kw;
+				char *err;
+
+				kw = srv_find_kw(args[cur_arg]);
+				if (kw) {
+					char *err = NULL;
+					int code;
+
+					if (!kw->parse) {
+						Alert("parsing [%s:%d] : '%s %s' : '%s' option is not implemented in this version (check build options).\n",
+						      file, linenum, args[0], args[1], args[cur_arg]);
+						cur_arg += 1 + kw->skip ;
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+
+					if (defsrv && !kw->default_ok) {
+						Alert("parsing [%s:%d] : '%s %s' : '%s' option is not accepted in default-server sections.\n",
+						      file, linenum, args[0], args[1], args[cur_arg]);
+						cur_arg += 1 + kw->skip ;
+						err_code |= ERR_ALERT;
+						continue;
+					}
+
+					code = kw->parse(args, &cur_arg, curproxy, newsrv, &err);
+					err_code |= code;
+
+					if (code) {
+						if (err && *err) {
+							indent_msg(&err, 2);
+							Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
+						}
+						else
+							Alert("parsing [%s:%d] : '%s %s' : error encountered while processing '%s'.\n",
+							      file, linenum, args[0], args[1], args[cur_arg]);
+						if (code & ERR_FATAL) {
+							free(err);
+							cur_arg += 1 + kw->skip;
+							goto out;
+						}
+					}
+					free(err);
+					cur_arg += 1 + kw->skip;
+					continue;
+				}
+
+				err = NULL;
+				if (!srv_dumped) {
+					srv_dump_kws(&err);
+					indent_msg(&err, 4);
+					srv_dumped = 1;
+				}
+
+				Alert("parsing [%s:%d] : '%s %s' unknown keyword '%s'.%s%s\n",
+				      file, linenum, args[0], args[1], args[cur_arg],
+				      err ? " Registered keywords :" : "", err ? err : "");
+				free(err);
 
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
@@ -4906,43 +4741,68 @@ stats_error_parsing:
 				goto out;
 			}
 
-			/* try to get the port from check_addr if check_port not set */
-			if (!newsrv->check_port)
-				newsrv->check_port = get_host_port(&newsrv->check_addr);
+			/* If neither a port nor an addr was specified and no check transport
+			 * layer is forced, then the transport layer used by the checks is the
+			 * same as for the production traffic. Otherwise we use raw_sock by
+			 * default, unless one is specified.
+			 */
+			if (!newsrv->check.port && !is_addr(&newsrv->check.addr)) {
+#ifdef USE_OPENSSL
+				newsrv->check.use_ssl |= newsrv->use_ssl;
+#endif
+				newsrv->check.send_proxy |= (newsrv->state & SRV_SEND_PROXY);
+			}
+			/* try to get the port from check.addr if check.port not set */
+			if (!newsrv->check.port)
+				newsrv->check.port = get_host_port(&newsrv->check.addr);
 
-			if (!newsrv->check_port && !(newsrv->state & SRV_MAPPORTS))
-				newsrv->check_port = realport; /* by default */
-			if (!newsrv->check_port) {
+			if (!newsrv->check.port && !(newsrv->state & SRV_MAPPORTS))
+				newsrv->check.port = realport; /* by default */
+			if (!newsrv->check.port) {
 				/* not yet valid, because no port was set on
 				 * the server either. We'll check if we have
 				 * a known port on the first listener.
 				 */
-				struct listener *l = curproxy->listen;
-				while (l && !(newsrv->check_port = get_host_port(&l->addr)))
-					l = l->next;
+				struct listener *l;
+
+				list_for_each_entry(l, &curproxy->conf.listeners, by_fe) {
+					newsrv->check.port = get_host_port(&l->addr);
+					if (newsrv->check.port)
+						break;
+				}
 			}
-			if (!newsrv->check_port) {
+			if (!newsrv->check.port) {
 				Alert("parsing [%s:%d] : server %s has neither service port nor check port. Check has been disabled.\n",
 				      file, linenum, newsrv->id);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
 
-			/* Allocate buffer for partial check results... */
-			if ((newsrv->check_data = calloc(global.tune.chksize, sizeof(char))) == NULL) {
+			/* Allocate buffer for check requests... */
+			if ((newsrv->check.bi = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
 				Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
 				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
 			}
+			newsrv->check.bi->size = global.tune.chksize;
+
+			/* Allocate buffer for check responses... */
+			if ((newsrv->check.bo = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
+				Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+			newsrv->check.bo->size = global.tune.chksize;
 
 			/* Allocate buffer for partial check results... */
-			if ((newsrv->check_conn = calloc(1, sizeof(struct connection))) == NULL) {
+			if ((newsrv->check.conn = calloc(1, sizeof(struct connection))) == NULL) {
 				Alert("parsing [%s:%d] : out of memory while allocating check connection.\n", file, linenum);
 				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
 			}
 
-			newsrv->check_status = HCHK_STATUS_INI;
+			newsrv->check.conn->t.sock.fd = -1; /* no check in progress yet */
+			newsrv->check.status = HCHK_STATUS_INI;
 			newsrv->state |= SRV_CHECKED;
 		}
 
@@ -4959,6 +4819,11 @@ stats_error_parsing:
 	else if (strcmp(args[0], "unique-id-format") == 0) {
 		if (!*(args[1])) {
 			Alert("parsing [%s:%d] : %s expects an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (*(args[2])) {
+			Alert("parsing [%s:%d] : %s expects only one argument, don't forget to escape spaces!\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -4979,6 +4844,11 @@ stats_error_parsing:
 	else if (strcmp(args[0], "log-format") == 0) {
 		if (!*(args[1])) {
 			Alert("parsing [%s:%d] : %s expects an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (*(args[2])) {
+			Alert("parsing [%s:%d] : %s expects only one argument, don't forget to escape spaces!\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -5162,7 +5032,7 @@ stats_error_parsing:
 						name = end;
 						if (*end == '-')
 							end++;
-						while (isdigit(*end))
+						while (isdigit((int)*end))
 							end++;
 						curproxy->bind_hdr_occ = strl2ic(name, end-name);
 					}
@@ -5222,7 +5092,7 @@ stats_error_parsing:
 				continue;
 			}
 			Alert("parsing [%s:%d] : '%s' only supports optional keywords '%s' and '%s'.\n",
-			      file, linenum, args[0], "inteface", "usesrc");
+			      file, linenum, args[0], "interface", "usesrc");
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -5577,6 +5447,70 @@ stats_error_parsing:
 			free(err);
 		}
 	}
+	else if (!strcmp(args[0], "compression")) {
+		struct comp *comp;
+		if (curproxy->comp == NULL) {
+			comp = calloc(1, sizeof(struct comp));
+			curproxy->comp = comp;
+		} else {
+			comp = curproxy->comp;
+		}
+
+		if (!strcmp(args[1], "algo")) {
+			int cur_arg;
+			struct comp_ctx *ctx;
+
+			cur_arg = 2;
+			if (!*args[cur_arg]) {
+				Alert("parsing [%s:%d] : '%s' expects <algorithm>\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			while (*(args[cur_arg])) {
+				if (comp_append_algo(comp, args[cur_arg]) < 0) {
+					Alert("parsing [%s:%d] : '%s' : '%s' is not a supported algorithm.\n",
+					      file, linenum, args[0], args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				if (curproxy->comp->algos->init(&ctx, 9) == 0) {
+					curproxy->comp->algos->end(&ctx);
+				} else {
+					Alert("parsing [%s:%d] : '%s' : Can't init '%s' algorithm.\n",
+					      file, linenum, args[0], args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				cur_arg ++;
+				continue;
+			}
+		}
+		else if (!strcmp(args[1], "offload")) {
+			comp->offload = 1;
+		}
+		else if (!strcmp(args[1], "type")) {
+			int cur_arg;
+			cur_arg = 2;
+			if (!*args[cur_arg]) {
+				Alert("parsing [%s:%d] : '%s' expects <type>\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			while (*(args[cur_arg])) {
+				comp_append_type(comp, args[cur_arg]);
+				cur_arg ++;
+				continue;
+			}
+		}
+		else {
+			Alert("parsing [%s:%d] : '%s' expects 'algo', 'type' or 'offload'\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+		}
+	}
 	else {
 		struct cfg_kw_list *kwl;
 		int index;
@@ -5587,9 +5521,7 @@ stats_error_parsing:
 					continue;
 				if (strcmp(kwl->kw[index].kw, args[0]) == 0) {
 					/* prepare error message just in case */
-					snprintf(trash, trashlen,
-						 "error near '%s' in %s section", args[0], cursection);
-					rc = kwl->kw[index].parse(args, CFG_LISTEN, curproxy, &defproxy, &errmsg);
+					rc = kwl->kw[index].parse(args, CFG_LISTEN, curproxy, &defproxy, file, linenum, &errmsg);
 					if (rc < 0) {
 						Alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
 						err_code |= ERR_ALERT | ERR_FATAL;
@@ -5604,7 +5536,7 @@ stats_error_parsing:
 				}
 			}
 		}
-		
+
 		Alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section\n", file, linenum, args[0], cursection);
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto out;
@@ -6011,15 +5943,23 @@ int check_config_validity()
 	struct userlist *curuserlist = NULL;
 	int err_code = 0;
 	unsigned int next_pxid = 1;
-	struct ssl_conf *ssl_conf, *ssl_back;
+	struct bind_conf *bind_conf;
 
-	ssl_back = ssl_conf = NULL;
+	bind_conf = NULL;
 	/*
 	 * Now, check for the integrity of all that we have collected.
 	 */
 
 	/* will be needed further to delay some tasks */
 	tv_update_date(0,1);
+
+	if (!global.tune.max_http_hdr)
+		global.tune.max_http_hdr = MAX_HTTP_HDR;
+
+	if (!global.tune.cookie_len)
+		global.tune.cookie_len = CAPTURE_LEN;
+
+	pool2_capture = create_pool("capture", global.tune.cookie_len, MEM_F_SHARED);
 
 	/* first, we will invert the proxy list order */
 	curproxy = NULL;
@@ -6041,8 +5981,9 @@ int check_config_validity()
 		struct tcp_rule *trule;
 		struct listener *listener;
 		unsigned int next_id;
+		int nbproc;
 
-		if (!curproxy->uuid) {
+		if (curproxy->uuid < 0) {
 			/* proxy ID not set, use automatic numbering with first
 			 * spare entry starting with next_pxid.
 			 */
@@ -6059,6 +6000,9 @@ int check_config_validity()
 			curproxy = curproxy->next;
 			continue;
 		}
+
+		/* number of processes this proxy is bound to */
+		nbproc = curproxy->bind_proc ? popcount(curproxy->bind_proc) : global.nbproc;
 
 		switch (curproxy->mode) {
 		case PR_MODE_HEALTH:
@@ -6081,12 +6025,6 @@ int check_config_validity()
 		case PR_MODE_HTTP:
 			curproxy->acl_requires |= ACL_USE_L7_ANY;
 			break;
-		}
-
-		if ((curproxy->cap & PR_CAP_FE) && (curproxy->listen == NULL))  {
-			Alert("config : %s '%s' has no listen address. Please either specify a valid address on the <listen> line, or use the <bind> keyword.\n",
-			      proxy_type_str(curproxy), curproxy->id);
-			cfgerr++;
 		}
 
 		if ((curproxy->cap & PR_CAP_BE) && (curproxy->mode != PR_MODE_HEALTH)) {
@@ -6510,6 +6448,14 @@ out_uri_auth_compat:
 			memcpy(curproxy->check_req, sslv3_client_hello_pkt, curproxy->check_len);
 		}
 
+		/* ensure that cookie capture length is not too large */
+		if (curproxy->capture_len >= global.tune.cookie_len) {
+			Warning("config : truncating capture length to %d bytes for %s '%s'.\n",
+				global.tune.cookie_len - 1, proxy_type_str(curproxy), curproxy->id);
+			err_code |= ERR_WARN;
+			curproxy->capture_len = global.tune.cookie_len - 1;
+		}
+
 		/* The small pools required for the capture lists */
 		if (curproxy->nb_req_cap) {
 			if (curproxy->mode == PR_MODE_HTTP) {
@@ -6605,56 +6551,10 @@ out_uri_auth_compat:
 			}
 
 #ifdef USE_OPENSSL
-#ifndef SSL_OP_NO_COMPRESSION     /* needs OpenSSL >= 0.9.9 */
-#define SSL_OP_NO_COMPRESSION 0
-#endif
-#ifndef SSL_MODE_RELEASE_BUFFERS  /* needs OpenSSL >= 1.0.0 */
-#define SSL_MODE_RELEASE_BUFFERS 0
-#endif
-#ifndef SSL_OP_NO_COMPRESSION     /* needs OpenSSL >= 0.9.9 */
-#define SSL_OP_NO_COMPRESSION 0
-#endif
-			if (newsrv->use_ssl) {
-				int ssloptions =
-					SSL_OP_ALL | /* all known workarounds for bugs */
-					SSL_OP_NO_SSLv2 |
-					SSL_OP_NO_COMPRESSION;
-				int sslmode =
-					SSL_MODE_ENABLE_PARTIAL_WRITE |
-					SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
-					SSL_MODE_RELEASE_BUFFERS;
-
-				/* Initiate SSL context for current server */
-				newsrv->ssl_ctx.reused_sess = NULL;
-				newsrv->data = &ssl_sock;
-				newsrv->ssl_ctx.ctx = SSL_CTX_new(SSLv23_client_method());
-				if(!newsrv->ssl_ctx.ctx) {
-
-					Alert("config : %s '%s', server '%s': unable to allocate ssl context.\n",
-						proxy_type_str(curproxy), curproxy->id,
-						newsrv->id);
-						cfgerr++;
-						goto next_srv;
-				}
-
-				if (newsrv->ssl_ctx.nosslv3)
-					ssloptions |= SSL_OP_NO_SSLv3;
-				if (newsrv->ssl_ctx.notlsv1)
-					ssloptions |= SSL_OP_NO_TLSv1;
-				SSL_CTX_set_options(newsrv->ssl_ctx.ctx, ssloptions);
-				SSL_CTX_set_mode(newsrv->ssl_ctx.ctx, sslmode);
-				SSL_CTX_set_verify(newsrv->ssl_ctx.ctx, SSL_VERIFY_NONE, NULL);
-				SSL_CTX_set_session_cache_mode(newsrv->ssl_ctx.ctx, SSL_SESS_CACHE_OFF);
-				if (newsrv->ssl_ctx.ciphers &&
-				    !SSL_CTX_set_cipher_list(newsrv->ssl_ctx.ctx, newsrv->ssl_ctx.ciphers)) {
-					Alert("Proxy '%s', server '%s' [%s:%d] : unable to set SSL cipher list to '%s'.\n",
-					      curproxy->id, newsrv->id,
-					      newsrv->conf.file, newsrv->conf.line, newsrv->ssl_ctx.ciphers);
-					cfgerr++;
-					goto next_srv;
-				}
-			}
+			if (newsrv->use_ssl || newsrv->check.use_ssl)
+				cfgerr += ssl_sock_prepare_srv_ctx(newsrv, curproxy);
 #endif /* USE_OPENSSL */
+
 			if (newsrv->trackit) {
 				struct proxy *px;
 				struct server *srv;
@@ -6860,7 +6760,8 @@ out_uri_auth_compat:
 		}
 
 		if (curproxy->cap & PR_CAP_FE) {
-			curproxy->accept = frontend_accept;
+			if (!curproxy->accept)
+				curproxy->accept = frontend_accept;
 
 			if (curproxy->tcp_req.inspect_delay ||
 			    !LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules))
@@ -6895,48 +6796,40 @@ out_uri_auth_compat:
 				curproxy->be_req_ana |= AN_REQ_PRST_RDP_COOKIE;
 		}
 
-		listener = NULL;
-		while (curproxy->listen) {
-			struct listener *next;
-
-			next = curproxy->listen->next;
-			curproxy->listen->next = listener;
-			listener = curproxy->listen;
-
-			if (!next)
-				break;
-
-			curproxy->listen = next;
-		}
-
 #ifdef USE_OPENSSL
 		/* Configure SSL for each bind line.
 		 * Note: if configuration fails at some point, the ->ctx member
 		 * remains NULL so that listeners can later detach.
 		 */
-		list_for_each_entry(ssl_conf, &curproxy->conf.ssl_bind, by_fe) {
-			if (!ssl_conf->default_ctx) {
+		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
+			if (!bind_conf->is_ssl) {
+				if (bind_conf->default_ctx) {
+					Warning("Proxy '%s': A certificate was specified but SSL was not enabled on bind '%s' at [%s:%d] (use 'ssl').\n",
+					        curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+				}
+				continue;
+			}
+			if (!bind_conf->default_ctx) {
 				Alert("Proxy '%s': no SSL certificate specified for bind '%s' at [%s:%d] (use 'crt').\n",
-				      curproxy->id, ssl_conf->arg, ssl_conf->file, ssl_conf->line);
+				      curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
 				cfgerr++;
 				continue;
 			}
 
-			if (shared_context_init(global.tune.sslcachesize) < 0) {
+			if (shared_context_init(global.tune.sslcachesize, (global.nbproc > 1) ? 1 : 0) < 0) {
 				Alert("Unable to allocate SSL session cache.\n");
 				cfgerr++;
 				continue;
 			}
 
 			/* initialize all certificate contexts */
-			cfgerr += ssl_sock_prepare_all_ctx(ssl_conf, curproxy);
+			cfgerr += ssl_sock_prepare_all_ctx(bind_conf, curproxy);
 		}
 #endif /* USE_OPENSSL */
 
 		/* adjust this proxy's listeners */
 		next_id = 1;
-		listener = curproxy->listen;
-		while (listener) {
+		list_for_each_entry(listener, &curproxy->conf.listeners, by_fe) {
 			if (!listener->luid) {
 				/* listener ID not set, use automatic numbering with first
 				 * spare entry starting with next_luid.
@@ -6950,31 +6843,34 @@ out_uri_auth_compat:
 			/* enable separate counters */
 			if (curproxy->options2 & PR_O2_SOCKSTAT) {
 				listener->counters = (struct licounters *)calloc(1, sizeof(struct licounters));
-				if (!listener->name) {
-					sprintf(trash, "sock-%d", listener->luid);
-					listener->name = strdup(trash);
-				}
+				if (!listener->name)
+					memprintf(&listener->name, "sock-%d", listener->luid);
 			}
-#ifdef USE_OPENSSL
-			if (listener->ssl_conf) {
-				if (listener->ssl_conf->default_ctx) {
-					listener->data = &ssl_sock; /* SSL data layer */
-				}
-				else {
-					listener->ssl_conf->ref_cnt--;
-					listener->ssl_conf = NULL;
-				}
-			}
-#endif
+
 			if (curproxy->options & PR_O_TCP_NOLING)
 				listener->options |= LI_O_NOLINGER;
 			if (!listener->maxconn)
 				listener->maxconn = curproxy->maxconn;
 			if (!listener->backlog)
 				listener->backlog = curproxy->backlog;
+			if (!listener->maxaccept)
+				listener->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : 64;
+
+			/* we want to have an optimal behaviour on single process mode to
+			 * maximize the work at once, but in multi-process we want to keep
+			 * some fairness between processes, so we target half of the max
+			 * number of events to be balanced over all the processes the proxy
+			 * is bound to. Rememeber that maxaccept = -1 must be kept as it is
+			 * used to disable the limit.
+			 */
+			if (listener->maxaccept > 0) {
+				if (nbproc > 1)
+					listener->maxaccept = (listener->maxaccept + 1) / 2;
+				listener->maxaccept = (listener->maxaccept + nbproc - 1) / nbproc;
+			}
+
 			listener->timeout = &curproxy->timeout.client;
 			listener->accept = session_accept;
-			listener->frontend = curproxy;
 			listener->handler = process_session;
 			listener->analysers |= curproxy->fe_req_ana;
 
@@ -6986,29 +6882,23 @@ out_uri_auth_compat:
 
 			/* smart accept mode is automatic in HTTP mode */
 			if ((curproxy->options2 & PR_O2_SMARTACC) ||
-			    ((curproxy->mode == PR_MODE_HTTP || listener->ssl_conf) &&
+			    ((curproxy->mode == PR_MODE_HTTP || listener->bind_conf->is_ssl) &&
 			     !(curproxy->no_options2 & PR_O2_SMARTACC)))
 				listener->options |= LI_O_NOQUICKACK;
-
-			/* We want the use_backend and default_backend rules to apply */
-			listener = listener->next;
 		}
 
-#ifdef USE_OPENSSL
-		/* Release unused SSL configs.
-		 */
-		list_for_each_entry_safe(ssl_conf, ssl_back, &curproxy->conf.ssl_bind, by_fe) {
-			if (ssl_conf->ref_cnt)
+		/* Release unused SSL configs */
+		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
+			if (bind_conf->is_ssl)
 				continue;
-
-			ssl_sock_free_all_ctx(ssl_conf);
-			free(ssl_conf->ciphers);
-			free(ssl_conf->file);
-			free(ssl_conf->arg);
-			LIST_DEL(&ssl_conf->by_fe);
-			free(ssl_conf);
-		}
+#ifdef USE_OPENSSL
+			ssl_sock_free_all_ctx(bind_conf);
+			free(bind_conf->ca_file);
+			free(bind_conf->ciphers);
+			free(bind_conf->ecdhe);
+			free(bind_conf->crl_file);
 #endif /* USE_OPENSSL */
+		}
 
 		/* Check multi-process mode compatibility for the current proxy */
 		if (global.nbproc > 1) {
@@ -7068,8 +6958,8 @@ out_uri_auth_compat:
 
 	/* Check multi-process mode compatibility */
 	if (global.nbproc > 1) {
-		if (global.stats_fe) {
-			Warning("stats socket will not work correctly in multi-process mode (nbproc > 1).\n");
+		if (global.stats_fe && !global.stats_fe->bind_proc) {
+			Warning("stats socket will not work as expected in multi-process mode (nbproc > 1), you should force process binding using 'stats bind-process'.\n");
 		}
 	}
 
@@ -7245,6 +7135,7 @@ out_uri_auth_compat:
 		while (*last) {
 			curpeers = *last;
 			if (curpeers->peers_fe) {
+				LIST_NEXT(&curpeers->peers_fe->conf.listeners, struct listener *, by_fe)->maxaccept = 1;
 				last = &curpeers->next;
 				continue;
 			}
@@ -7269,9 +7160,6 @@ out_uri_auth_compat:
 			*last = curpeers;
 		}
 	}
-
-	if (!global.tune.max_http_hdr)
-		global.tune.max_http_hdr = MAX_HTTP_HDR;
 
 	pool2_hdr_idx = create_pool("hdr_idx",
 				    global.tune.max_http_hdr * sizeof(struct hdr_idx_elem),

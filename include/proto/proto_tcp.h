@@ -30,7 +30,7 @@
 int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct sockaddr_storage *remote);
 void tcpv4_add_listener(struct listener *listener);
 void tcpv6_add_listener(struct listener *listener);
-int tcp_connect_server(struct connection *conn, int data);
+int tcp_connect_server(struct connection *conn, int data, int delack);
 int tcp_connect_probe(struct connection *conn);
 int tcp_get_src(int fd, struct sockaddr *sa, socklen_t salen, int dir);
 int tcp_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir);
@@ -48,15 +48,15 @@ static inline struct stktable_key *addr_to_stktable_key(struct sockaddr_storage 
 {
 	switch (addr->ss_family) {
 	case AF_INET:
-		static_table_key.key = (void *)&((struct sockaddr_in *)addr)->sin_addr;
+		static_table_key->key = (void *)&((struct sockaddr_in *)addr)->sin_addr;
 		break;
 	case AF_INET6:
-		static_table_key.key = (void *)&((struct sockaddr_in6 *)addr)->sin6_addr;
+		static_table_key->key = (void *)&((struct sockaddr_in6 *)addr)->sin6_addr;
 		break;
 	default:
 		return NULL;
 	}
-	return &static_table_key;
+	return static_table_key;
 }
 
 

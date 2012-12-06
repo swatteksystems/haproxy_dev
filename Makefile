@@ -15,8 +15,8 @@
 #   USE_NETFILTER        : enable netfilter on Linux. Automatic.
 #   USE_PCRE             : enable use of libpcre for regex. Recommended.
 #   USE_POLL             : enable poll(). Automatic.
+#   USE_PRIVATE_CACHE    : disable shared memory cache of ssl sessions.
 #   USE_REGPARM          : enable regparm optimization. Recommended on x86.
-#   USE_SEPOLL           : enable speculative epoll(). Automatic.
 #   USE_STATIC_PCRE      : enable static libpcre. Recommended.
 #   USE_TPROXY           : enable transparent proxy. Automatic.
 #   USE_LINUX_TPROXY     : enable full transparent proxy. Automatic.
@@ -27,6 +27,10 @@
 #   USE_GETADDRINFO      : use getaddrinfo() to resolve IPv6 host names.
 #   USE_OPENSSL          : enable use of OpenSSL. Recommended, but see below.
 #   USE_FUTEX            : enable use of futex on kernel 2.6. Automatic.
+#   USE_ACCEPT4          : enable use of accept4() on linux. Automatic.
+#   USE_MY_ACCEPT4       : use own implemention of accept4() if glibc < 2.10.
+#   USE_ZLIB             : enable zlib library support.
+#   USE_CPU_AFFINITY     : enable pinning processes to CPU on Linux. Automatic.
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -138,6 +142,11 @@ ADDLIB =
 # Use DEFINE=-Dxxx to set any tunable macro. Anything declared here will appear
 # in the build options reported by "haproxy -vv". Use SILENT_DEFINE if you do
 # not want to pollute the report with complex defines.
+# The following settings might be of interest when SSL is enabled :
+#   LISTEN_DEFAULT_CIPHERS is a cipher suite string used to set the default SSL
+#           ciphers on "bind" lines instead of using OpenSSL's defaults.
+#   CONNECT_DEFAULT_CIPHERS is a cipher suite string used to set the default
+#           SSL ciphers on "server" lines instead of using OpenSSL's defaults.
 DEFINE =
 SILENT_DEFINE =
 
@@ -207,7 +216,6 @@ ifeq ($(TARGET),linux24e)
   USE_NETFILTER   = implicit
   USE_POLL        = implicit
   USE_EPOLL       = implicit
-  USE_SEPOLL      = implicit
   USE_MY_EPOLL    = implicit
   USE_TPROXY      = implicit
   USE_LIBCRYPT    = implicit
@@ -218,7 +226,6 @@ ifeq ($(TARGET),linux26)
   USE_NETFILTER   = implicit
   USE_POLL        = implicit
   USE_EPOLL       = implicit
-  USE_SEPOLL      = implicit
   USE_TPROXY      = implicit
   USE_LIBCRYPT    = implicit
   USE_FUTEX       = implicit
@@ -229,12 +236,13 @@ ifeq ($(TARGET),linux2628)
   USE_NETFILTER   = implicit
   USE_POLL        = implicit
   USE_EPOLL       = implicit
-  USE_SEPOLL      = implicit
   USE_TPROXY      = implicit
   USE_LIBCRYPT    = implicit
   USE_LINUX_SPLICE= implicit
   USE_LINUX_TPROXY= implicit
+  USE_ACCEPT4     = implicit
   USE_FUTEX       = implicit
+  USE_CPU_AFFINITY= implicit
 else
 ifeq ($(TARGET),solaris)
   # This is for Solaris 8
@@ -393,6 +401,15 @@ OPTIONS_CFLAGS  += -DUSE_GETADDRINFO
 BUILD_OPTIONS   += $(call ignore_implicit,USE_GETADDRINFO)
 endif
 
+ifneq ($(USE_ZLIB),)
+# Use ZLIB_INC and ZLIB_LIB to force path to zlib.h and libz.{a,so} if needed.
+ZLIB_INC =
+ZLIB_LIB =
+OPTIONS_CFLAGS  += -DUSE_ZLIB $(if $(ZLIB_INC),-I$(ZLIB_INC))
+BUILD_OPTIONS   += $(call ignore_implicit,USE_ZLIB)
+OPTIONS_LDFLAGS += $(if $(ZLIB_LIB),-L$(ZLIB_LIB)) -lz
+endif
+
 ifneq ($(USE_POLL),)
 OPTIONS_CFLAGS += -DENABLE_POLL
 OPTIONS_OBJS   += src/ev_poll.o
@@ -403,12 +420,6 @@ ifneq ($(USE_EPOLL),)
 OPTIONS_CFLAGS += -DENABLE_EPOLL
 OPTIONS_OBJS   += src/ev_epoll.o
 BUILD_OPTIONS  += $(call ignore_implicit,USE_EPOLL)
-endif
-
-ifneq ($(USE_SEPOLL),)
-OPTIONS_CFLAGS += -DENABLE_SEPOLL
-OPTIONS_OBJS   += src/ev_sepoll.o
-BUILD_OPTIONS  += $(call ignore_implicit,USE_SEPOLL)
 endif
 
 ifneq ($(USE_MY_EPOLL),)
@@ -428,9 +439,24 @@ OPTIONS_CFLAGS += -DCONFIG_HAP_LINUX_VSYSCALL
 BUILD_OPTIONS  += $(call ignore_implicit,USE_VSYSCALL)
 endif
 
+ifneq ($(USE_CPU_AFFINITY),)
+OPTIONS_CFLAGS += -DUSE_CPU_AFFINITY
+BUILD_OPTIONS  += $(call ignore_implicit,USE_CPU_AFFINITY)
+endif
+
 ifneq ($(USE_MY_SPLICE),)
 OPTIONS_CFLAGS += -DUSE_MY_SPLICE
 BUILD_OPTIONS  += $(call ignore_implicit,USE_MY_SPLICE)
+endif
+
+ifneq ($(USE_ACCEPT4),)
+OPTIONS_CFLAGS += -DUSE_ACCEPT4
+BUILD_OPTIONS  += $(call ignore_implicit,USE_ACCEPT4)
+endif
+
+ifneq ($(USE_MY_ACCEPT4),)
+OPTIONS_CFLAGS += -DUSE_MY_ACCEPT4
+BUILD_OPTIONS  += $(call ignore_implicit,USE_MY_ACCEPT4)
 endif
 
 ifneq ($(USE_NETFILTER),)
@@ -476,10 +502,14 @@ BUILD_OPTIONS   += $(call ignore_implicit,USE_OPENSSL)
 OPTIONS_CFLAGS  += -DUSE_OPENSSL
 OPTIONS_LDFLAGS += -lssl -lcrypto
 OPTIONS_OBJS  += src/ssl_sock.o src/shctx.o
+ifneq ($(USE_PRIVATE_CACHE),)
+OPTIONS_CFLAGS  += -DUSE_PRIVATE_CACHE
+else
 ifneq ($(USE_FUTEX),)
 OPTIONS_CFLAGS  += -DUSE_SYSCALL_FUTEX
 else
 OPTIONS_LDFLAGS += -lpthread
+endif
 endif
 endif
 
@@ -560,9 +590,9 @@ else
 all: haproxy
 endif
 
-OBJS = src/haproxy.o src/sessionhash.o src/base64.o src/protocols.o \
+OBJS = src/haproxy.o src/sessionhash.o src/base64.o src/protocol.o \
        src/uri_auth.o src/standard.o src/buffer.o src/log.o src/task.o \
-       src/chunk.o src/channel.o \
+       src/chunk.o src/channel.o src/listener.o \
        src/time.o src/fd.o src/pipe.o src/regex.o src/cfgparse.o src/server.o \
        src/checks.o src/queue.o src/frontend.o src/proxy.o src/peers.o \
        src/arg.o src/stick_table.o src/proto_uxst.o src/connection.o \
@@ -571,6 +601,7 @@ OBJS = src/haproxy.o src/sessionhash.o src/base64.o src/protocols.o \
        src/stream_interface.o src/dumpstats.o src/proto_tcp.o \
        src/session.o src/hdr_idx.o src/ev_select.o src/signal.o \
        src/acl.o src/sample.o src/memory.o src/freq_ctr.o src/auth.o \
+       src/compression.o
 
 EBTREE_OBJS = $(EBTREE_DIR)/ebtree.o \
               $(EBTREE_DIR)/eb32tree.o $(EBTREE_DIR)/eb64tree.o \

@@ -42,9 +42,10 @@
 #include <proto/channel.h>
 #include <proto/connection.h>
 #include <proto/fd.h>
+#include <proto/listener.h>
 #include <proto/log.h>
 #include <proto/port_range.h>
-#include <proto/protocols.h>
+#include <proto/protocol.h>
 #include <proto/proto_tcp.h>
 #include <proto/proxy.h>
 #include <proto/sample.h>
@@ -169,14 +170,18 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
 
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 	if (foreign_ok) {
-		ret = bind(fd, (struct sockaddr *)&bind_addr, get_addr_len(&bind_addr));
-		if (ret < 0)
-			return 2;
+		if (is_addr(&bind_addr)) {
+			ret = bind(fd, (struct sockaddr *)&bind_addr, get_addr_len(&bind_addr));
+			if (ret < 0)
+				return 2;
+		}
 	}
 	else {
-		ret = bind(fd, (struct sockaddr *)local, get_addr_len(local));
-		if (ret < 0)
-			return 1;
+		if (is_addr(local)) {
+			ret = bind(fd, (struct sockaddr *)local, get_addr_len(local));
+			if (ret < 0)
+				return 1;
+		}
 	}
 
 	if (!flags)
@@ -215,10 +220,14 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
  * pointed to by conn->addr.from in case of transparent proxying. Normal source
  * bind addresses are still determined locally (due to the possible need of a
  * source port). conn->target may point either to a valid server or to a backend,
- * depending on conn->target.type. Only TARG_TYPE_PROXY and TARG_TYPE_SERVER are
+ * depending on conn->target. Only OBJ_TYPE_PROXY and OBJ_TYPE_SERVER are
  * supported. The <data> parameter is a boolean indicating whether there are data
  * waiting for being sent or not, in order to adjust data write polling and on
- * some platforms, the ability to avoid an empty initial ACK.
+ * some platforms, the ability to avoid an empty initial ACK. The <delack> argument
+ * allows the caller to force using a delayed ACK when establishing the connection :
+ *   - 0 = no delayed ACK unless data are advertised and backend has tcp-smart-connect
+ *   - 1 = delayed ACK if backend has tcp-smart-connect, regardless of data
+ *   - 2 = delayed ACK regardless of backend options
  *
  * It can return one of :
  *  - SN_ERR_NONE if everything's OK
@@ -228,21 +237,24 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
  *  - SN_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
  *  - SN_ERR_INTERNAL for any other purely internal errors
  * Additionnally, in the case of SN_ERR_RESOURCE, an emergency log will be emitted.
+ *
+ * The connection's fd is inserted only when SN_ERR_NONE is returned, otherwise
+ * it's invalid and the caller has nothing to do.
  */
 
-int tcp_connect_server(struct connection *conn, int data)
+int tcp_connect_server(struct connection *conn, int data, int delack)
 {
 	int fd;
 	struct server *srv;
 	struct proxy *be;
 
-	switch (conn->target.type) {
-	case TARG_TYPE_PROXY:
-		be = conn->target.ptr.p;
+	switch (obj_type(conn->target)) {
+	case OBJ_TYPE_PROXY:
+		be = objt_proxy(conn->target);
 		srv = NULL;
 		break;
-	case TARG_TYPE_SERVER:
-		srv = conn->target.ptr.s;
+	case OBJ_TYPE_SERVER:
+		srv = objt_server(conn->target);
 		be = srv->proxy;
 		break;
 	default:
@@ -294,15 +306,17 @@ int tcp_connect_server(struct connection *conn, int data)
 	if (srv != NULL && srv->state & SRV_BIND_SRC) {
 		int ret, flags = 0;
 
-		switch (srv->state & SRV_TPROXY_MASK) {
-		case SRV_TPROXY_ADDR:
-		case SRV_TPROXY_CLI:
-			flags = 3;
-			break;
-		case SRV_TPROXY_CIP:
-		case SRV_TPROXY_DYN:
-			flags = 1;
-			break;
+		if (is_addr(&conn->addr.from)) {
+			switch (srv->state & SRV_TPROXY_MASK) {
+			case SRV_TPROXY_ADDR:
+			case SRV_TPROXY_CLI:
+				flags = 3;
+				break;
+			case SRV_TPROXY_CIP:
+			case SRV_TPROXY_DYN:
+				flags = 1;
+				break;
+			}
 		}
 
 #ifdef SO_BINDTODEVICE
@@ -367,15 +381,17 @@ int tcp_connect_server(struct connection *conn, int data)
 	else if (be->options & PR_O_BIND_SRC) {
 		int ret, flags = 0;
 
-		switch (be->options & PR_O_TPXY_MASK) {
-		case PR_O_TPXY_ADDR:
-		case PR_O_TPXY_CLI:
-			flags = 3;
-			break;
-		case PR_O_TPXY_CIP:
-		case PR_O_TPXY_DYN:
-			flags = 1;
-			break;
+		if (is_addr(&conn->addr.from)) {
+			switch (be->options & PR_O_TPXY_MASK) {
+			case PR_O_TPXY_ADDR:
+			case PR_O_TPXY_CLI:
+				flags = 3;
+				break;
+			case PR_O_TPXY_CIP:
+			case PR_O_TPXY_DYN:
+				flags = 1;
+				break;
+			}
 		}
 
 #ifdef SO_BINDTODEVICE
@@ -408,7 +424,7 @@ int tcp_connect_server(struct connection *conn, int data)
 	 * machine with the first ACK. We only do this if there are pending
 	 * data in the buffer.
 	 */
-	if ((be->options2 & PR_O2_SMARTCON) && data)
+	if (delack == 2 || ((delack || data) && (be->options2 & PR_O2_SMARTCON)))
                 setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof(zero));
 #endif
 
@@ -459,7 +475,7 @@ int tcp_connect_server(struct connection *conn, int data)
 	fd_insert(fd);
 	conn_sock_want_send(conn);  /* for connect status */
 
-	if (conn_data_init(conn) < 0) {
+	if (conn_xprt_init(conn) < 0) {
 		fd_delete(fd);
 		return SN_ERR_RESOURCE;
 	}
@@ -549,8 +565,8 @@ int tcp_connect_probe(struct connection *conn)
 	}
 
 	/* The FD is ready now, we'll mark the connection as complete and
-	 * forward the event to the data layer which will update the stream
-	 * interface flags.
+	 * forward the event to the transport layer which will notify the
+	 * data layer.
 	 */
 	conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	return 1;
@@ -674,6 +690,23 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		}
 	}
 #endif
+#if defined(TCP_FASTOPEN)
+	if (listener->options & LI_O_TCP_FO) {
+		/* TFO needs a queue length, let's use the configured backlog */
+		int qlen = listener->backlog ? listener->backlog : listener->maxconn;
+		if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen)) == -1) {
+			msg = "cannot enable TCP_FASTOPEN";
+			err |= ERR_WARN;
+		}
+	}
+#endif
+#if defined(IPV6_V6ONLY)
+	if (listener->options & LI_O_V6ONLY)
+                setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+	else if (listener->options & LI_O_V4V6)
+                setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
+#endif
+
 	if (bind(fd, (struct sockaddr *)&listener->addr, listener->proto->sock_addrlen) == -1) {
 		err |= ERR_RETRYABLE | ERR_ALERT;
 		msg = "cannot bind socket";
@@ -781,7 +814,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->i,
+		req->buf->i,
 		req->analysers);
 
 	/* We don't know whether we have enough data, so must proceed
@@ -794,7 +827,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 	 * - if one rule returns KO, then return KO
 	 */
 
-	if ((req->flags & CF_SHUTR) || buffer_full(&req->buf, global.tune.maxrewrite) ||
+	if ((req->flags & CF_SHUTR) || buffer_full(req->buf, global.tune.maxrewrite) ||
 	    !s->be->tcp_req.inspect_delay || tick_is_expired(req->analyse_exp, now_ms))
 		partial = SMP_OPT_FINAL;
 	else
@@ -844,7 +877,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts) {
 						session_track_stkctr1(s, t, ts);
 						if (s->fe != s->be)
@@ -860,7 +893,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts) {
 						session_track_stkctr2(s, t, ts);
 						if (s->fe != s->be)
@@ -900,7 +933,7 @@ int tcp_inspect_response(struct session *s, struct channel *rep, int an_bit)
 		rep,
 		rep->rex, rep->wex,
 		rep->flags,
-		rep->i,
+		rep->buf->i,
 		rep->analysers);
 
 	/* We don't know whether we have enough data, so must proceed
@@ -1014,7 +1047,7 @@ int tcp_exec_req_rules(struct session *s)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts)
 						session_track_stkctr1(s, t, ts);
 				}
@@ -1027,7 +1060,7 @@ int tcp_exec_req_rules(struct session *s)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts)
 						session_track_stkctr2(s, t, ts);
 				}
@@ -1166,7 +1199,8 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
  * keyword.
  */
 static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
-                             struct proxy *defpx, char **err)
+                             struct proxy *defpx, const char *file, int line,
+                             char **err)
 {
 	const char *ptr = NULL;
 	unsigned int val;
@@ -1247,7 +1281,8 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
  * keyword.
  */
 static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
-                             struct proxy *defpx, char **err)
+                             struct proxy *defpx, const char *file, int line,
+                             char **err)
 {
 	const char *ptr = NULL;
 	unsigned int val;
@@ -1387,11 +1422,11 @@ smp_fetch_rdp_cookie(struct proxy *px, struct session *l4, void *l7, unsigned in
 	smp->flags = 0;
 	smp->type = SMP_T_CSTR;
 
-	bleft = l4->req->buf.i;
+	bleft = l4->req->buf->i;
 	if (bleft <= 11)
 		goto too_short;
 
-	data = (const unsigned char *)l4->req->buf.p + 11;
+	data = (const unsigned char *)l4->req->buf->p + 11;
 	bleft -= 11;
 
 	if (bleft <= 7)
@@ -1490,13 +1525,13 @@ static int
 smp_fetch_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
               const struct arg *args, struct sample *smp)
 {
-	switch (l4->si[0].conn.addr.from.ss_family) {
+	switch (l4->si[0].conn->addr.from.ss_family) {
 	case AF_INET:
-		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn.addr.from)->sin_addr;
+		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn->addr.from)->sin_addr;
 		smp->type = SMP_T_IPV4;
 		break;
 	case AF_INET6:
-		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn.addr.from))->sin6_addr;
+		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn->addr.from))->sin6_addr;
 		smp->type = SMP_T_IPV6;
 		break;
 	default:
@@ -1513,7 +1548,7 @@ smp_fetch_sport(struct proxy *px, struct session *l4, void *l7, unsigned int opt
                 const struct arg *args, struct sample *smp)
 {
 	smp->type = SMP_T_UINT;
-	if (!(smp->data.uint = get_host_port(&l4->si[0].conn.addr.from)))
+	if (!(smp->data.uint = get_host_port(&l4->si[0].conn->addr.from)))
 		return 0;
 
 	smp->flags = 0;
@@ -1525,15 +1560,15 @@ static int
 smp_fetch_dst(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
               const struct arg *args, struct sample *smp)
 {
-	conn_get_to_addr(&l4->si[0].conn);
+	conn_get_to_addr(l4->si[0].conn);
 
-	switch (l4->si[0].conn.addr.to.ss_family) {
+	switch (l4->si[0].conn->addr.to.ss_family) {
 	case AF_INET:
-		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn.addr.to)->sin_addr;
+		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn->addr.to)->sin_addr;
 		smp->type = SMP_T_IPV4;
 		break;
 	case AF_INET6:
-		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn.addr.to))->sin6_addr;
+		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn->addr.to))->sin6_addr;
 		smp->type = SMP_T_IPV6;
 		break;
 	default:
@@ -1549,10 +1584,10 @@ static int
 smp_fetch_dport(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                 const struct arg *args, struct sample *smp)
 {
-	conn_get_to_addr(&l4->si[0].conn);
+	conn_get_to_addr(l4->si[0].conn);
 
 	smp->type = SMP_T_UINT;
-	if (!(smp->data.uint = get_host_port(&l4->si[0].conn.addr.to)))
+	if (!(smp->data.uint = get_host_port(&l4->si[0].conn->addr.to)))
 		return 0;
 
 	smp->flags = 0;
@@ -1567,7 +1602,7 @@ smp_fetch_payload_lv(struct proxy *px, struct session *l4, void *l7, unsigned in
 	unsigned int len_size = arg_p[1].data.uint;
 	unsigned int buf_offset;
 	unsigned int buf_size = 0;
-	struct channel *b;
+	struct channel *chn;
 	int i;
 
 	/* Format is (len offset, len size, buf offset) or (len offset, len size) */
@@ -1577,16 +1612,16 @@ smp_fetch_payload_lv(struct proxy *px, struct session *l4, void *l7, unsigned in
 	if (!l4)
 		return 0;
 
-	b = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
+	chn = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
 
-	if (!b)
+	if (!chn)
 		return 0;
 
-	if (len_offset + len_size > b->buf.i)
+	if (len_offset + len_size > chn->buf->i)
 		goto too_short;
 
 	for (i = 0; i < len_size; i++) {
-		buf_size = (buf_size << 8) + ((unsigned char *)b->buf.p)[i + len_offset];
+		buf_size = (buf_size << 8) + ((unsigned char *)chn->buf->p)[i + len_offset];
 	}
 
 	/* buf offset may be implicit, absolute or relative */
@@ -1596,18 +1631,18 @@ smp_fetch_payload_lv(struct proxy *px, struct session *l4, void *l7, unsigned in
 	else if (arg_p[2].type == ARGT_SINT)
 		buf_offset += arg_p[2].data.sint;
 
-	if (!buf_size || buf_size > b->buf.size || buf_offset + buf_size > b->buf.size) {
+	if (!buf_size || buf_size > chn->buf->size || buf_offset + buf_size > chn->buf->size) {
 		/* will never match */
 		smp->flags = 0;
 		return 0;
 	}
 
-	if (buf_offset + buf_size > b->buf.i)
+	if (buf_offset + buf_size > chn->buf->i)
 		goto too_short;
 
 	/* init chunk as read only */
 	smp->type = SMP_T_CBIN;
-	chunk_initlen(&smp->data.str, b->buf.p + buf_offset, 0, buf_size);
+	chunk_initlen(&smp->data.str, chn->buf->p + buf_offset, 0, buf_size);
 	smp->flags = SMP_F_VOLATILE;
 	return 1;
 
@@ -1622,28 +1657,28 @@ smp_fetch_payload(struct proxy *px, struct session *l4, void *l7, unsigned int o
 {
 	unsigned int buf_offset = arg_p[0].data.uint;
 	unsigned int buf_size = arg_p[1].data.uint;
-	struct channel *b;
+	struct channel *chn;
 
 	if (!l4)
 		return 0;
 
-	b = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
+	chn = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
 
-	if (!b)
+	if (!chn)
 		return 0;
 
-	if (!buf_size || buf_size > b->buf.size || buf_offset + buf_size > b->buf.size) {
+	if (!buf_size || buf_size > chn->buf->size || buf_offset + buf_size > chn->buf->size) {
 		/* will never match */
 		smp->flags = 0;
 		return 0;
 	}
 
-	if (buf_offset + buf_size > b->buf.i)
+	if (buf_offset + buf_size > chn->buf->i)
 		goto too_short;
 
 	/* init chunk as read only */
 	smp->type = SMP_T_CBIN;
-	chunk_initlen(&smp->data.str, b->buf.p + buf_offset, 0, buf_size);
+	chunk_initlen(&smp->data.str, chn->buf->p + buf_offset, 0, buf_size);
 	smp->flags = SMP_F_VOLATILE;
 	return 1;
 
@@ -1663,8 +1698,7 @@ smp_fetch_payload(struct proxy *px, struct session *l4, void *l7, unsigned int o
 static int val_payload(struct arg *arg, char **err_msg)
 {
 	if (!arg[1].data.uint) {
-		if (err_msg)
-			memprintf(err_msg, "payload length must be > 0");
+		memprintf(err_msg, "payload length must be > 0");
 		return 0;
 	}
 	return 1;
@@ -1682,19 +1716,138 @@ static int val_payload(struct arg *arg, char **err_msg)
 static int val_payload_lv(struct arg *arg, char **err_msg)
 {
 	if (!arg[1].data.uint) {
-		if (err_msg)
-			memprintf(err_msg, "payload length must be > 0");
+		memprintf(err_msg, "payload length must be > 0");
 		return 0;
 	}
 
 	if (arg[2].type == ARGT_SINT &&
 	    (int)(arg[0].data.uint + arg[1].data.uint + arg[2].data.sint) < 0) {
-		if (err_msg)
-			memprintf(err_msg, "payload offset too negative");
+		memprintf(err_msg, "payload offset too negative");
 		return 0;
 	}
 	return 1;
 }
+
+#ifdef IPV6_V6ONLY
+/* parse the "v4v6" bind keyword */
+static int bind_parse_v4v6(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_V4V6;
+	}
+
+	return 0;
+}
+
+/* parse the "v6only" bind keyword */
+static int bind_parse_v6only(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_V6ONLY;
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_HAP_LINUX_TPROXY
+/* parse the "transparent" bind keyword */
+static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_FOREIGN;
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef TCP_DEFER_ACCEPT
+/* parse the "defer-accept" bind keyword */
+static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_DEF_ACCEPT;
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef TCP_FASTOPEN
+/* parse the "defer-accept" bind keyword */
+static int bind_parse_tfo(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_TCP_FO;
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef TCP_MAXSEG
+/* parse the "mss" bind keyword */
+static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+	int mss;
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing MSS value", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	mss = atoi(args[cur_arg + 1]);
+	if (!mss || abs(mss) > 65535) {
+		memprintf(err, "'%s' : expects an MSS with and absolute value between 1 and 65535", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->maxseg = mss;
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef SO_BINDTODEVICE
+/* parse the "mss" bind keyword */
+static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing interface name", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->interface = strdup(args[cur_arg + 1]);
+	}
+
+	global.last_checks |= LSTCHK_NETADM;
+	return 0;
+}
+#endif
 
 static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_LISTEN, "tcp-request", tcp_parse_tcp_req },
@@ -1733,6 +1886,47 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
 	{ NULL, NULL, 0, 0, 0 },
 }};
 
+/************************************************************************/
+/*           All supported bind keywords must be declared here.         */
+/************************************************************************/
+
+/* Note: must not be declared <const> as its list will be overwritten.
+ * Please take care of keeping this list alphabetically sorted, doing so helps
+ * all code contributors.
+ * Optional keywords are also declared with a NULL ->parse() function so that
+ * the config parser can report an appropriate error when a known keyword was
+ * not enabled.
+ */
+static struct bind_kw_list bind_kws = { "TCP", { }, {
+#ifdef TCP_DEFER_ACCEPT
+	{ "defer-accept",  bind_parse_defer_accept, 0 }, /* wait for some data for 1 second max before doing accept */
+#endif
+#ifdef SO_BINDTODEVICE
+	{ "interface",     bind_parse_interface,    1 }, /* specifically bind to this interface */
+#endif
+#ifdef TCP_MAXSEG
+	{ "mss",           bind_parse_mss,          1 }, /* set MSS of listening socket */
+#endif
+#ifdef TCP_FASTOPEN
+	{ "tfo",           bind_parse_tfo,          0 }, /* enable TCP_FASTOPEN of listening socket */
+#endif
+#ifdef CONFIG_HAP_LINUX_TPROXY
+	{ "transparent",   bind_parse_transparent,  0 }, /* transparently bind to the specified addresses */
+#endif
+#ifdef IPV6_V6ONLY
+	{ "v4v6",          bind_parse_v4v6,         0 }, /* force socket to bind to IPv4+IPv6 */
+	{ "v6only",        bind_parse_v6only,       0 }, /* force socket to bind to IPv6 only */
+#endif
+	/* the versions with the NULL parse function*/
+	{ "defer-accept",  NULL,  0 },
+	{ "interface",     NULL,  1 },
+	{ "mss",           NULL,  1 },
+	{ "transparent",   NULL,  0 },
+	{ "v4v6",          NULL,  0 },
+	{ "v6only",        NULL,  0 },
+	{ NULL, NULL, 0 },
+}};
+
 __attribute__((constructor))
 static void __tcp_protocol_init(void)
 {
@@ -1741,6 +1935,7 @@ static void __tcp_protocol_init(void)
 	sample_register_fetches(&sample_fetch_keywords);
 	cfg_register_keywords(&cfg_kws);
 	acl_register_keywords(&acl_kws);
+	bind_register_keywords(&bind_kws);
 }
 
 

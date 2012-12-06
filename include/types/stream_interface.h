@@ -27,6 +27,7 @@
 
 #include <types/channel.h>
 #include <types/connection.h>
+#include <types/obj_type.h>
 #include <common/config.h>
 
 /* A stream interface must have its own errors independently of the buffer's,
@@ -108,7 +109,7 @@ struct stream_interface {
 	unsigned int err_type;  /* first error detected, one of SI_ET_* */
 	void *err_loc;          /* commonly the server, NULL when SI_ET_NONE */
 
-	struct connection conn; /* descriptor for a connection */
+	struct connection *conn; /* descriptor for a connection */
 	struct si_ops *ops;     /* general operations at the stream interface layer */
 
 	void (*release)(struct stream_interface *); /* handler to call after the last close() */
@@ -122,7 +123,7 @@ struct stream_interface {
 			struct {
 				struct proxy *px;
 				struct server *sv;
-				struct listener *l;
+				void *l;
 				int px_st;		/* STAT_PX_ST* */
 				unsigned int flags;	/* STAT_* */
 				int iid, type, sid;	/* proxy id, type and service id if bounding of stats is enabled */
@@ -160,8 +161,9 @@ struct stream_interface {
 
 /* An applet designed to run in a stream interface */
 struct si_applet {
-	char *name; /* applet's name to report in logs */
-	void (*fct)(struct stream_interface *);  /* internal I/O handler, may never be NULL */
+	enum obj_type obj_type;                      /* object type = OBJ_TYPE_APPLET */
+	char *name;                                  /* applet's name to report in logs */
+	void (*fct)(struct stream_interface *);      /* internal I/O handler, may never be NULL */
 	void (*release)(struct stream_interface *);  /* callback to release resources, may be NULL */
 };
 

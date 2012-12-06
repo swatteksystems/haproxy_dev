@@ -484,21 +484,6 @@ int ishex(char s)
 }
 
 /*
- * Return integer equivalent of character <c> for a hex digit (0-9, a-f, A-F),
- * otherwise -1. This compact form helps gcc produce efficient code.
- */
-int hex2i(int c)
-{
-	if ((unsigned char)(c -= '0') > 9) {
-		if ((unsigned char)(c -= 'A' - '0') > 5 &&
-		    (unsigned char)(c -= 'a' - 'A') > 5)
-			c = -11;
-		c += 10;
-	}
-	return c;
-}
-
-/*
  * Checks <name> for invalid characters. Valid chars are [A-Za-z0-9_:.-]. If an
  * invalid character is found, a pointer to it is returned. If everything is
  * fine, NULL is returned.
@@ -906,12 +891,12 @@ int url2sa(const char *url, int ulen, struct sockaddr_storage *addr)
 			 * be warned this can slow down global daemon performances
 			 * while handling lagging dns responses.
 			 */
-			ret = url2ipv4(curr, &((struct sockaddr_in *)&addr)->sin_addr);
+			ret = url2ipv4(curr, &((struct sockaddr_in *)addr)->sin_addr);
 			if (!ret)
 				return -1;
 			curr += ret;
 			((struct sockaddr_in *)addr)->sin_port = (*curr == ':') ? str2uic(++curr) : 80;
-			((struct sockaddr_in *)addr)->sin_port = htons(((struct sockaddr_in *)&addr)->sin_port);
+			((struct sockaddr_in *)addr)->sin_port = htons(((struct sockaddr_in *)addr)->sin_port);
 		}
 		return 0;
 	}
@@ -1745,7 +1730,7 @@ char *date2str_log(char *dst, struct tm *tm, struct timeval *date, size_t size)
  */
 char *gmt2str_log(char *dst, struct tm *tm, size_t size)
 {
-	if (size < 27) /* the size is fixed: 24 chars + \0 */
+	if (size < 27) /* the size is fixed: 26 chars + \0 */
 		return NULL;
 
 	dst = utoa_pad((unsigned int)tm->tm_mday, dst, 3); // day
@@ -1771,6 +1756,36 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size)
 	return dst;
 }
 
+/* localdate2str_log: write a date in the format :
+ * "%02d/%s/%04d:%02d:%02d:%02d +0000(local timezone)" without using snprintf
+ * * return a pointer to the last char written (\0) or
+ * * NULL if there isn't enough space.
+ */
+char *localdate2str_log(char *dst, struct tm *tm, size_t size)
+{
+	if (size < 27) /* the size is fixed: 26 chars + \0 */
+		return NULL;
+
+	dst = utoa_pad((unsigned int)tm->tm_mday, dst, 3); // day
+	*dst++ = '/';
+	memcpy(dst, monthname[tm->tm_mon], 3); // month
+	dst += 3;
+	*dst++ = '/';
+	dst = utoa_pad((unsigned int)tm->tm_year+1900, dst, 5); // year
+	*dst++ = ':';
+	dst = utoa_pad((unsigned int)tm->tm_hour, dst, 3); // hour
+	*dst++ = ':';
+	dst = utoa_pad((unsigned int)tm->tm_min, dst, 3); // minutes
+	*dst++ = ':';
+	dst = utoa_pad((unsigned int)tm->tm_sec, dst, 3); // secondes
+	*dst++ = ' ';
+	memcpy(dst, localtimezone, 5); // timezone
+	dst += 5;
+	*dst = '\0';
+
+	return dst;
+}
+
 /* Dynamically allocates a string of the proper length to hold the formatted
  * output. NULL is returned on error. The caller is responsible for freeing the
  * memory area using free(). The resulting string is returned in <out> if the
@@ -1788,7 +1803,8 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size)
  * This means that <err> must be initialized to NULL before first invocation.
  * The return value also holds the allocated string, which eases error checking
  * and immediate consumption. If the output pointer is not used, NULL must be
- * passed instead and it will be ignored.
+ * passed instead and it will be ignored. The returned message will then also
+ * be NULL so that the caller does not have to bother with freeing anything.
  *
  * It is also convenient to use it without any free except the last one :
  *    err = NULL;
@@ -1803,6 +1819,9 @@ char *memprintf(char **out, const char *format, ...)
 	char *ret = NULL;
 	int allocated = 0;
 	int needed = 0;
+
+	if (!out)
+		return NULL;
 
 	do {
 		/* vsnprintf() will return the required length even when the
@@ -1830,6 +1849,78 @@ char *memprintf(char **out, const char *format, ...)
 		free(*out);
 		*out = ret;
 	}
+
+	return ret;
+}
+
+/* Used to add <level> spaces before each line of <out>, unless there is only one line.
+ * The input argument is automatically freed and reassigned. The result will have to be
+ * freed by the caller. It also supports being passed a NULL which results in the same
+ * output.
+ * Example of use :
+ *   parse(cmd, &err); (callee: memprintf(&err, ...))
+ *   fprintf(stderr, "Parser said: %s\n", indent_error(&err));
+ *   free(err);
+ */
+char *indent_msg(char **out, int level)
+{
+	char *ret, *in, *p;
+	int needed = 0;
+	int lf = 0;
+	int lastlf = 0;
+	int len;
+
+	if (!out || !*out)
+		return NULL;
+
+	in = *out - 1;
+	while ((in = strchr(in + 1, '\n')) != NULL) {
+		lastlf = in - *out;
+		lf++;
+	}
+
+	if (!lf) /* single line, no LF, return it as-is */
+		return *out;
+
+	len = strlen(*out);
+
+	if (lf == 1 && lastlf == len - 1) {
+		/* single line, LF at end, strip it and return as-is */
+		(*out)[lastlf] = 0;
+		return *out;
+	}
+
+	/* OK now we have at least one LF, we need to process the whole string
+	 * as a multi-line string. What we'll do :
+	 *   - prefix with an LF if there is none
+	 *   - add <level> spaces before each line
+	 * This means at most ( 1 + level + (len-lf) + lf*<1+level) ) =
+	 *   1 + level + len + lf * level = 1 + level * (lf + 1) + len.
+	 */
+
+	needed = 1 + level * (lf + 1) + len + 1;
+	p = ret = malloc(needed);
+	in = *out;
+
+	/* skip initial LFs */
+	while (*in == '\n')
+		in++;
+
+	/* copy each line, prefixed with LF and <level> spaces, and without the trailing LF */
+	while (*in) {
+		*p++ = '\n';
+		memset(p, ' ', level);
+		p += level;
+		do {
+			*p++ = *in++;
+		} while (*in && *in != '\n');
+		if (*in)
+			in++;
+	}
+	*p = 0;
+
+	free(*out);
+	*out = ret;
 
 	return ret;
 }

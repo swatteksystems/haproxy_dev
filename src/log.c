@@ -33,6 +33,9 @@
 #include <proto/frontend.h>
 #include <proto/log.h>
 #include <proto/stream_interface.h>
+#ifdef USE_OPENSSL
+#include <proto/ssl_sock.h>
+#endif
 
 const char *log_facilities[NB_LOG_FACILITIES] = {
 	"kern", "user", "mail", "daemon",
@@ -77,9 +80,11 @@ static const struct logformat_type logformat_keywords[] = {
 	{ "Si", LOG_FMT_SERVERIP, PR_MODE_TCP, LW_SVIP, NULL }, /* server destination ip */
 	{ "t", LOG_FMT_DATE, PR_MODE_TCP, LW_INIT, NULL },      /* date */
 	{ "T", LOG_FMT_DATEGMT, PR_MODE_TCP, LW_INIT, NULL },   /* date GMT */
+	{ "Tl", LOG_FMT_DATELOCAL, PR_MODE_TCP, LW_INIT, NULL },   /* date local timezone */
 	{ "Ts", LOG_FMT_TS, PR_MODE_TCP, LW_INIT, NULL },   /* timestamp GMT */
 	{ "ms", LOG_FMT_MS, PR_MODE_TCP, LW_INIT, NULL },       /* accept date millisecond */
 	{ "f", LOG_FMT_FRONTEND, PR_MODE_TCP, LW_INIT, NULL },  /* frontend */
+	{ "ft", LOG_FMT_FRONTEND_XPRT, PR_MODE_TCP, LW_INIT, NULL },  /* frontend with transport mode */
 	{ "b", LOG_FMT_BACKEND, PR_MODE_TCP, LW_INIT, NULL },   /* backend */
 	{ "s", LOG_FMT_SERVER, PR_MODE_TCP, LW_SVID, NULL },    /* server */
 	{ "B", LOG_FMT_BYTES, PR_MODE_TCP, LW_BYTES, NULL },     /* bytes read */
@@ -109,12 +114,14 @@ static const struct logformat_type logformat_keywords[] = {
 	{ "rt", LOG_FMT_COUNTER, PR_MODE_HTTP, LW_REQ, NULL }, /* HTTP request counter */
 	{ "H", LOG_FMT_HOSTNAME, PR_MODE_TCP, LW_INIT, NULL }, /* Hostname */
 	{ "ID", LOG_FMT_UNIQUEID, PR_MODE_HTTP, LW_BYTES, NULL }, /* Unique ID */
+	{ "sslc", LOG_FMT_SSL_CIPHER, PR_MODE_TCP, LW_XPRT, NULL }, /* client-side SSL ciphers */
+	{ "sslv", LOG_FMT_SSL_VERSION, PR_MODE_TCP, LW_XPRT, NULL }, /* client-side SSL protocol version */
 	{ 0, 0, 0, 0, NULL }
 };
 
-char default_http_log_format[] = "%Ci:%Cp [%t] %f %b/%s %Tq/%Tw/%Tc/%Tr/%Tt %st %B %cc %cs %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r"; // default format
-char clf_http_log_format[] = "%{+Q}o %{-Q}Ci - - [%T] %r %st %B \"\" \"\" %Cp %ms %f %b %s %Tq %Tw %Tc %Tr %Tt %tsc %ac %fc %bc %sc %rc %sq %bq %cc %cs %hrl %hsl";
-char default_tcp_log_format[] = "%Ci:%Cp [%t] %f %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq";
+char default_http_log_format[] = "%Ci:%Cp [%t] %ft %b/%s %Tq/%Tw/%Tc/%Tr/%Tt %st %B %cc %cs %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r"; // default format
+char clf_http_log_format[] = "%{+Q}o %{-Q}Ci - - [%T] %r %st %B \"\" \"\" %Cp %ms %ft %b %s %Tq %Tw %Tc %Tr %Tt %tsc %ac %fc %bc %sc %rc %sq %bq %cc %cs %hrl %hsl";
+char default_tcp_log_format[] = "%Ci:%Cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq";
 char *log_format = NULL;
 
 /* This is a global syslog line, common to all outgoing messages. It begins
@@ -491,7 +498,7 @@ int get_log_facility(const char *fac)
  *
  * Return the adress of the \0 character, or NULL on error
  */
-char *lf_text(char *dst, char *src, size_t size, struct logformat_node *node)
+char *lf_text(char *dst, const char *src, size_t size, struct logformat_node *node)
 {
 	int n;
 
@@ -793,12 +800,12 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 
 	if (!(tolog & LW_SVID))
 		svid = "-";
-	else switch (s->target.type) {
-	case TARG_TYPE_SERVER:
-		svid = s->target.ptr.s->id;
+	else switch (obj_type(s->target)) {
+	case OBJ_TYPE_SERVER:
+		svid = objt_server(s->target)->id;
 		break;
-	case TARG_TYPE_APPLET:
-		svid = s->target.ptr.a->name;
+	case OBJ_TYPE_APPLET:
+		svid = objt_applet(s->target)->name;
 		break;
 	default:
 		svid = "<NOSRV>";
@@ -816,7 +823,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 		return 0;
 
 	list_for_each_entry(tmp, list_format, list) {
-		char *src = NULL;
+		const char *src = NULL;
 		switch (tmp->type) {
 
 			case LOG_FMT_SEPARATOR:
@@ -836,7 +843,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_CLIENTIP:  // %Ci
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn.addr.from,
+				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.from,
 					    dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -845,10 +852,10 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_CLIENTPORT:  // %Cp
-				if (s->req->prod->conn.addr.from.ss_family == AF_UNIX) {
+				if (s->req->prod->conn->addr.from.ss_family == AF_UNIX) {
 					ret = ltoa_o(s->listener->luid, tmplog, dst + maxsize - tmplog);
 				} else {
-					ret = lf_port(tmplog, (struct sockaddr *)&s->req->prod->conn.addr.from,
+					ret = lf_port(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.from,
 						      dst + maxsize - tmplog, tmp);
 				}
 				if (ret == NULL)
@@ -858,8 +865,8 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_FRONTENDIP: // %Fi
-				conn_get_to_addr(&s->req->prod->conn);
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn.addr.to,
+				conn_get_to_addr(s->req->prod->conn);
+				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.to,
 					    dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -868,12 +875,12 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case  LOG_FMT_FRONTENDPORT: // %Fp
-				conn_get_to_addr(&s->req->prod->conn);
-				if (s->req->prod->conn.addr.to.ss_family == AF_UNIX) {
+				conn_get_to_addr(s->req->prod->conn);
+				if (s->req->prod->conn->addr.to.ss_family == AF_UNIX) {
 					ret = ltoa_o(s->listener->luid,
 						     tmplog, dst + maxsize - tmplog);
 				} else {
-					ret = lf_port(tmplog, (struct sockaddr *)&s->req->prod->conn.addr.to,
+					ret = lf_port(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.to,
 						      dst + maxsize - tmplog, tmp);
 				}
 				if (ret == NULL)
@@ -883,7 +890,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_BACKENDIP:  // %Bi
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn.addr.from,
+				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.from,
 					    dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -892,7 +899,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_BACKENDPORT:  // %Bp
-				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn.addr.from,
+				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.from,
 					      dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -901,7 +908,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_SERVERIP: // %Si
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn.addr.to,
+				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.to,
 					    dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -910,7 +917,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_SERVERPORT: // %Sp
-				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn.addr.to,
+				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.to,
 					      dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -931,6 +938,15 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 			case LOG_FMT_DATEGMT: // %T
 				get_gmtime(s->logs.accept_date.tv_sec, &tm);
 				ret = gmt2str_log(tmplog, &tm, dst + maxsize - tmplog);
+				if (ret == NULL)
+					goto out;
+				tmplog = ret;
+				last_isspace = 0;
+				break;
+
+			case LOG_FMT_DATELOCAL: // %Tl
+				get_localtime(s->logs.accept_date.tv_sec, &tm);
+				ret = localdate2str_log(tmplog, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -981,6 +997,45 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
+			case LOG_FMT_FRONTEND_XPRT: // %ft
+				src = fe->id;
+				if (tmp->options & LOG_OPT_QUOTE)
+					LOGCHAR('"');
+				iret = strlcpy2(tmplog, src, dst + maxsize - tmplog);
+				if (iret == 0)
+					goto out;
+				tmplog += iret;
+#ifdef USE_OPENSSL
+				if (s->listener->xprt == &ssl_sock)
+					LOGCHAR('~');
+#endif
+				if (tmp->options & LOG_OPT_QUOTE)
+					LOGCHAR('"');
+				last_isspace = 0;
+				break;
+#ifdef USE_OPENSSL
+			case LOG_FMT_SSL_CIPHER: // %sslc
+				src = NULL;
+				if (s->listener->xprt == &ssl_sock)
+					src = ssl_sock_get_cipher_name(s->si[0].conn);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
+				if (ret == NULL)
+					goto out;
+				tmplog = ret;
+				last_isspace = 0;
+				break;
+
+			case LOG_FMT_SSL_VERSION: // %sslv
+				src = NULL;
+				if (s->listener->xprt == &ssl_sock)
+					src = ssl_sock_get_proto_version(s->si[0].conn);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
+				if (ret == NULL)
+					goto out;
+				tmplog = ret;
+				last_isspace = 0;
+				break;
+#endif
 			case LOG_FMT_BACKEND: // %b
 				src = be->id;
 				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
@@ -1120,8 +1175,8 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_SRVCONN:  // %sc
-				ret = ultoa_o(target_srv(&s->target) ?
-				                 target_srv(&s->target)->cur_sess :
+				ret = ultoa_o(objt_server(s->target) ?
+				                 objt_server(s->target)->cur_sess :
 				                 0, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;

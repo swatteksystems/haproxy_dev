@@ -31,6 +31,8 @@
 extern struct pool_head *pool2_session;
 extern struct list sessions;
 
+extern struct data_cb sess_conn_cb;
+
 int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr);
 
 /* perform minimal intializations, report 0 in case of error, 1 if OK. */
@@ -47,7 +49,6 @@ int parse_track_counters(char **args, int *arg,
 			 int section_type, struct proxy *curpx,
 			 struct track_ctr_prm *prm,
 			 struct proxy *defpx, char **err);
-int conn_session_complete(struct connection *conn, int flag);
 
 /* Remove the refcount from the session to the tracked counters, and clear the
  * pointer to ensure this is only performed once. The caller is responsible for
@@ -159,12 +160,6 @@ static inline void session_track_stkctr2(struct session *s, struct stktable *t, 
 	s->stkctr2_table = t;
 	s->stkctr2_entry = ts;
 	session_start_counters(t, ts);
-}
-
-static void inline trace_term(struct session *s, unsigned int code)
-{
-	s->term_trace <<= TT_BIT_SHIFT;
-	s->term_trace |= code;
 }
 
 /* Increase the number of cumulated HTTP requests in the tracked counters */

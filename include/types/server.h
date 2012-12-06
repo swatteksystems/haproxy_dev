@@ -36,6 +36,7 @@
 #include <types/connection.h>
 #include <types/counters.h>
 #include <types/freq_ctr.h>
+#include <types/obj_type.h>
 #include <types/port_range.h>
 #include <types/proxy.h>
 #include <types/queue.h>
@@ -59,6 +60,7 @@
 #define SRV_TPROXY_MASK	0x0700	/* bind to a non-local address to reach this server */
 #define SRV_SEND_PROXY	0x0800	/* this server talks the PROXY protocol */
 #define SRV_NON_STICK	0x1000	/* never add connections allocated to this server to a stick table */
+#define SRV_CHK_RUNNING 0x2000  /* a check is currently running on this server */
 
 /* function which act on servers need to return various errors */
 #define SRV_STATUS_OK       0   /* everything is OK. */
@@ -69,8 +71,8 @@
 
 /* bits for s->result used for health-checks */
 #define SRV_CHK_UNKNOWN 0x0000   /* initialized to this by default */
-#define SRV_CHK_ERROR   0x0001   /* error encountered during the check; has precedence */
-#define SRV_CHK_RUNNING 0x0002   /* server seen as running */
+#define SRV_CHK_FAILED  0x0001   /* server check failed, flag has precedence over SRV_CHK_PASSED */
+#define SRV_CHK_PASSED  0x0002   /* server check succeeded unless FAILED is also set */
 #define SRV_CHK_DISABLE 0x0004   /* server returned a "disable" code */
 
 /* various constants */
@@ -78,6 +80,24 @@
 #define SRV_UWGHT_MAX   (SRV_UWGHT_RANGE - 1)
 #define SRV_EWGHT_RANGE (SRV_UWGHT_RANGE * BE_WEIGHT_SCALE)
 #define SRV_EWGHT_MAX   (SRV_UWGHT_MAX   * BE_WEIGHT_SCALE)
+
+#ifdef USE_OPENSSL
+/* server ssl options */
+#define SRV_SSL_O_NONE         0x0000
+#define SRV_SSL_O_NO_VMASK     0x000F /* force version mask */
+#define SRV_SSL_O_NO_SSLV3     0x0001 /* disable SSLv3 */
+#define SRV_SSL_O_NO_TLSV10    0x0002 /* disable TLSv1.0 */
+#define SRV_SSL_O_NO_TLSV11    0x0004 /* disable TLSv1.1 */
+#define SRV_SSL_O_NO_TLSV12    0x0008 /* disable TLSv1.2 */
+/* 0x000F reserved for 'no' protocol version options */
+#define SRV_SSL_O_USE_VMASK    0x00F0 /* force version mask */
+#define SRV_SSL_O_USE_SSLV3    0x0010 /* force SSLv3 */
+#define SRV_SSL_O_USE_TLSV10   0x0020 /* force TLSv1.0 */
+#define SRV_SSL_O_USE_TLSV11   0x0040 /* force TLSv1.1 */
+#define SRV_SSL_O_USE_TLSV12   0x0080 /* force TLSv1.2 */
+/* 0x00F0 reserved for 'force' protocol version options */
+#define SRV_SSL_O_NO_TLS_TICKETS 0x0100 /* disable session resumption tickets */
+#endif
 
 /* A tree occurrence is a descriptor of a place in a tree, with a pointer back
  * to the server itself.
@@ -89,6 +109,7 @@ struct tree_occ {
 };
 
 struct server {
+	enum obj_type obj_type;                 /* object type == OBJ_TYPE_SERVER */
 	struct server *next;
 	int state;				/* server state (SRV_*) */
 	int prev_state;				/* server state before last change (SRV_*) */
@@ -108,7 +129,6 @@ struct server {
 
 	struct list pendconns;			/* pending connections */
 	struct list actconns;			/* active connections */
-	struct task *check;                     /* the task associated to the health check processing */
 	struct task *warmup;                    /* the task dedicated to the warmup when slowstart is set */
 
 	int iface_len;				/* bind interface name length */
@@ -117,8 +137,6 @@ struct server {
 
 	struct server *tracknext, *track;	/* next server in a tracking list, tracked server */
 	char *trackit;				/* temporary variable to make assignment deferrable */
-	struct sockaddr_storage check_addr;	/* the address to check, if different from <addr> */
-	short check_port;			/* the port to use for the health checks */
 	int health;				/* 0->rise-1 = bad; rise->rise+fall-1 = good */
 	int consecutive_errors;			/* current number of consecutive errors */
 	int rise, fall;				/* time in iterations */
@@ -129,7 +147,6 @@ struct server {
 	int inter, fastinter, downinter;	/* checks: time in milliseconds */
 	int slowstart;				/* slowstart time in seconds (ms in the conf) */
 	int result;				/* health-check result : SRV_CHK_* */
-	int curfd;				/* file desc used for current test, or -1 if not in test */
 
 	char *id;				/* just for identification */
 	unsigned iweight,uweight, eweight;	/* initial weight, user-specified weight, and effective weight */
@@ -154,19 +171,27 @@ struct server {
 	int bind_hdr_occ;			/* occurrence number of header above: >0 = from first, <0 = from end, 0=disabled */
 #endif
 	struct protocol *proto;	                /* server address protocol */
-	struct data_ops *data;                  /* data-layer operations */
+	struct xprt_ops *xprt;                  /* transport-layer operations */
 	unsigned down_time;			/* total time the server was down */
 	time_t last_change;			/* last time, when the state was changed */
-	struct timeval check_start;		/* last health check start time */
-	long check_duration;			/* time in ms took to finish last health check */
-	short check_status, check_code;		/* check result, check code */
-	char check_desc[HCHK_DESC_LEN];		/* health check descritpion */
 
 	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo */
 
-	char *check_data;			/* storage of partial check results */
-	struct connection *check_conn;		/* connection state for health checks */
-	int check_data_len;			/* length of partial check results stored in check_data */
+	struct {                                /* health-check specific configuration */
+		struct connection *conn;        /* connection state for health checks */
+		struct protocol *proto;	        /* server address protocol for health checks */
+		struct xprt_ops *xprt;          /* transport layer operations for health checks */
+		struct sockaddr_storage addr;   /* the address to check, if different from <addr> */
+		short port;                     /* the port to use for the health checks */
+		struct buffer *bi, *bo;         /* input and output buffers to send/recv check */
+		struct task *task;              /* the task associated to the health check processing, NULL if disabled */
+		struct timeval start;           /* last health check start time */
+		long duration;                  /* time in ms took to finish last health check */
+		short status, code;             /* check result, check code */
+		char desc[HCHK_DESC_LEN];       /* health check descritpion */
+		int use_ssl;                    /* use SSL for health checks */
+		int send_proxy;                 /* send a PROXY protocol header with checks */
+	} check;
 
 #ifdef USE_OPENSSL
 	int use_ssl;				/* ssl enabled */
@@ -174,8 +199,11 @@ struct server {
 		SSL_CTX *ctx;
 		SSL_SESSION *reused_sess;
 		char *ciphers;			/* cipher suite to use if non-null */
-		int nosslv3;			/* disable SSLv3 */
-		int notlsv1;			/* disable TLSv1 */
+		int options;			/* ssl options */
+		int verify;			/* verify method (set of SSL_VERIFY_* flags) */
+		char *ca_file;			/* CAfile to use on verify */
+		char *crl_file;			/* CRLfile to use on verify */
+		char *client_crt;		/* client certificate to send */
 	} ssl_ctx;
 #endif
 	struct {
@@ -185,6 +213,31 @@ struct server {
 	} conf;					/* config information */
 };
 
+/* Descriptor for a "server" keyword. The ->parse() function returns 0 in case of
+ * success, or a combination of ERR_* flags if an error is encountered. The
+ * function pointer can be NULL if not implemented. The function also has an
+ * access to the current "server" config line. The ->skip value tells the parser
+ * how many words have to be skipped after the keyword. If the function needs to
+ * parse more keywords, it needs to update cur_arg.
+ */
+struct srv_kw {
+	const char *kw;
+	int (*parse)(char **args, int *cur_arg, struct proxy *px, struct server *srv, char **err);
+	int skip; /* nb min of args to skip, for use when kw is not handled */
+	int default_ok; /* non-zero if kw is supported in default-server section */
+};
+
+/*
+ * A keyword list. It is a NULL-terminated array of keywords. It embeds a
+ * struct list in order to be linked to other lists, allowing it to easily
+ * be declared where it is needed, and linked without duplicating data nor
+ * allocating memory. It is also possible to indicate a scope for the keywords.
+ */
+struct srv_kw_list {
+	const char *scope;
+	struct list list;
+	struct srv_kw kw[VAR_ARRAY];
+};
 
 #endif /* _TYPES_SERVER_H */
 

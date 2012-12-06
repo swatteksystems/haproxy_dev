@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2011  Willy Tarreau <w@1wt.eu>.
+ * Copyright 2000-2012  Willy Tarreau <w@1wt.eu>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -44,6 +44,11 @@
 #include <sys/resource.h>
 #include <time.h>
 #include <syslog.h>
+#ifdef USE_CPU_AFFINITY
+#define __USE_GNU
+#include <sched.h>
+#undef __USE_GNU
+#endif
 
 #ifdef DEBUG_FULL
 #include <assert.h>
@@ -73,13 +78,16 @@
 
 #include <proto/auth.h>
 #include <proto/acl.h>
+#include <proto/arg.h>
 #include <proto/backend.h>
 #include <proto/channel.h>
 #include <proto/checks.h>
+#include <proto/connection.h>
 #include <proto/fd.h>
 #include <proto/hdr_idx.h>
+#include <proto/listener.h>
 #include <proto/log.h>
-#include <proto/protocols.h>
+#include <proto/protocol.h>
 #include <proto/proto_http.h>
 #include <proto/proxy.h>
 #include <proto/queue.h>
@@ -98,6 +106,8 @@
 
 /*********************************************************************/
 
+extern const struct comp_algo comp_algos[];
+
 /*********************************************************************/
 
 /* list of config files */
@@ -107,17 +117,15 @@ int  relative_pid = 1;		/* process id starting at 1 */
 
 /* global options */
 struct global global = {
+	.nbproc = 1,
 	.req_count = 0,
 	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
-	.stats_sock = {
-		.perm = {
-			 .ux = {
-				 .uid = -1,
-				 .gid = -1,
-				 .mode = 0,
-			 }
-		 }
-	},
+#ifdef DEFAULT_MAXZLIBMEM
+	.maxzlibmem = DEFAULT_MAXZLIBMEM,
+#else
+	.maxzlibmem = 0,
+#endif
+	.comp_rate_lim = 0,
 	.unix_bind = {
 		 .ux = {
 			 .uid = -1,
@@ -130,11 +138,26 @@ struct global global = {
 		.maxrewrite = MAXREWRITE,
 		.chksize = BUFSIZE,
 #ifdef USE_OPENSSL
-		.sslcachesize = 20000,
+		.sslcachesize = SSLCACHESIZE,
 #endif
+#ifdef USE_ZLIB
+		.zlibmemlevel = 8,
+		.zlibwindowsize = MAX_WBITS,
+#endif
+		.comp_maxlevel = 1,
+
+
 	},
-#if defined (USE_OPENSSL) && defined(DEFAULT_MAXSSLCONN)
+#ifdef USE_OPENSSL
+#ifdef DEFAULT_MAXSSLCONN
 	.maxsslconn = DEFAULT_MAXSSLCONN,
+#endif
+#ifdef LISTEN_DEFAULT_CIPHERS
+	.listen_default_ciphers = LISTEN_DEFAULT_CIPHERS,
+#endif
+#ifdef CONNECT_DEFAULT_CIPHERS
+	.connect_default_ciphers = CONNECT_DEFAULT_CIPHERS,
+#endif
 #endif
 	/* others NULL OK */
 };
@@ -153,8 +176,7 @@ static int *oldpids = NULL;
 static int oldpids_sig; /* use USR1 or TERM */
 
 /* this is used to drain data, and as a temporary buffer for sprintf()... */
-char *trash = NULL;
-int trashlen = BUFSIZE;
+struct chunk trash = { };
 
 /* this buffer is always the same size as standard buffers and is used for
  * swapping data inside a buffer.
@@ -214,6 +236,24 @@ void display_build_opts()
 		"no"
 #endif
 		"\n");
+
+#ifdef USE_ZLIB
+	printf("Built with zlib version : " ZLIB_VERSION "\n");
+#else /* USE_ZLIB */
+	printf("Built without zlib support (USE_ZLIB not set)\n");
+#endif
+	printf("Compression algorithms supported :");
+	{
+		int i;
+
+		for (i = 0; comp_algos[i].name; i++) {
+			printf("%s %s", (i == 0 ? "" : ","), comp_algos[i].name);
+		}
+		if (i == 0) {
+			printf("none");
+		}
+	}
+	printf("\n");
 
 #ifdef USE_OPENSSL
 	printf("Built with OpenSSL version : " OPENSSL_VERSION_TEXT "\n");
@@ -278,9 +318,6 @@ void usage(char *name)
 #if defined(ENABLE_EPOLL)
 		"        -de disables epoll() usage even when available\n"
 #endif
-#if defined(ENABLE_SEPOLL)
-		"        -ds disables speculative epoll() usage even when available\n"
-#endif
 #if defined(ENABLE_KQUEUE)
 		"        -dk disables kqueue() usage even when available\n"
 #endif
@@ -344,37 +381,37 @@ void sig_dump_state(struct sig_handler *sh)
 
 		send_log(p, LOG_NOTICE, "SIGHUP received, dumping servers states for proxy %s.\n", p->id);
 		while (s) {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %lld tot.",
-				 p->id, s->id,
-				 (s->state & SRV_RUNNING) ? "UP" : "DOWN",
-				 s->cur_sess, s->nbpend, s->counters.cum_sess);
-			Warning("%s\n", trash);
-			send_log(p, LOG_NOTICE, "%s\n", trash);
+			chunk_printf(&trash,
+			             "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %lld tot.",
+			             p->id, s->id,
+			             (s->state & SRV_RUNNING) ? "UP" : "DOWN",
+			             s->cur_sess, s->nbpend, s->counters.cum_sess);
+			Warning("%s\n", trash.str);
+			send_log(p, LOG_NOTICE, "%s\n", trash.str);
 			s = s->next;
 		}
 
 		/* FIXME: those info are a bit outdated. We should be able to distinguish between FE and BE. */
 		if (!p->srv) {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
-				 p->id,
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			chunk_printf(&trash,
+			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             p->id,
+			             p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 		} else if (p->srv_act == 0) {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
-				 p->id,
-				 (p->srv_bck) ? "is running on backup servers" : "has no server available",
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			chunk_printf(&trash,
+			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             p->id,
+			             (p->srv_bck) ? "is running on backup servers" : "has no server available",
+			             p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 		} else {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
-				 " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
-				 p->id, p->srv_act, p->srv_bck,
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			chunk_printf(&trash,
+			             "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
+			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             p->id, p->srv_act, p->srv_bck,
+			             p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 		}
-		Warning("%s\n", trash);
-		send_log(p, LOG_NOTICE, "%s\n", trash);
+		Warning("%s\n", trash.str);
+		send_log(p, LOG_NOTICE, "%s\n", trash.str);
 
 		p = p->next;
 	}
@@ -400,8 +437,9 @@ void init(int argc, char **argv)
 	struct wordlist *wl;
 	char *progname;
 	char *change_dir = NULL;
+	struct tm curtime;
 
-	trash = malloc(trashlen);
+	chunk_init(&trash, malloc(global.tune.bufsize), global.tune.bufsize);
 
 	/* NB: POSIX does not make it mandatory for gethostname() to NULL-terminate
 	 * the string in case of truncation, and at least FreeBSD appears not to do
@@ -426,9 +464,14 @@ void init(int argc, char **argv)
 	tv_update_date(-1,-1);
 	start_date = now;
 
+	/* Get the numeric timezone. */
+	get_localtime(start_date.tv_sec, &curtime);
+	strftime(localtimezone, 6, "%z", &curtime);
+
 	signal_init();
 	init_task();
 	init_session();
+	init_connection();
 	/* warning, we init buffers later */
 	init_pendconn();
 	init_proto_http();
@@ -439,9 +482,6 @@ void init(int argc, char **argv)
 #endif
 #if defined(ENABLE_EPOLL)
 	global.tune.options |= GTUNE_USE_EPOLL;
-#endif
-#if defined(ENABLE_SEPOLL)
-	global.tune.options |= GTUNE_USE_SEPOLL;
 #endif
 #if defined(ENABLE_KQUEUE)
 	global.tune.options |= GTUNE_USE_KQUEUE;
@@ -475,10 +515,6 @@ void init(int argc, char **argv)
 #if defined(ENABLE_EPOLL)
 			else if (*flag == 'd' && flag[1] == 'e')
 				global.tune.options &= ~GTUNE_USE_EPOLL;
-#endif
-#if defined(ENABLE_SEPOLL)
-			else if (*flag == 'd' && flag[1] == 's')
-				global.tune.options &= ~GTUNE_USE_SEPOLL;
 #endif
 #if defined(ENABLE_POLL)
 			else if (*flag == 'd' && flag[1] == 'p')
@@ -604,7 +640,7 @@ void init(int argc, char **argv)
 				break;
 
 		for (px = proxy; px; px = px->next)
-			if (px->state == PR_STNEW && px->listen)
+			if (px->state == PR_STNEW && !LIST_ISEMPTY(&px->conf.listeners))
 				break;
 
 		if (pr || px) {
@@ -628,6 +664,7 @@ void init(int argc, char **argv)
 
 	/* now we know the buffer size, we can initialize the channels and buffers */
 	init_channel();
+	init_buffer();
 
 	if (have_appsession)
 		appsession_init();
@@ -687,18 +724,6 @@ void init(int argc, char **argv)
 	if (global.tune.maxpollevents <= 0)
 		global.tune.maxpollevents = MAX_POLL_EVENTS;
 
-	if (global.tune.maxaccept == 0) {
-		/* Note: we should not try to accept too many connections at once,
-		 * because past one point we're significantly reducing the cache
-		 * efficiency and the highest session rate significantly drops.
-		 * Values between 15 and 35 seem fine on a Core i5 with 4M L3 cache.
-		 */
-		if (global.nbproc > 1)
-			global.tune.maxaccept = 8;  /* leave some conns to other processes */
-		else
-			global.tune.maxaccept = 32; /* accept more incoming conns at once */
-	}
-
 	if (global.tune.recv_enough == 0)
 		global.tune.recv_enough = MIN_RECV_AT_ONCE_ENOUGH;
 
@@ -708,9 +733,16 @@ void init(int argc, char **argv)
 	if (arg_mode & (MODE_DEBUG | MODE_FOREGROUND)) {
 		/* command line debug mode inhibits configuration mode */
 		global.mode &= ~(MODE_DAEMON | MODE_QUIET);
+		global.mode |= (arg_mode & (MODE_DEBUG | MODE_FOREGROUND));
 	}
-	global.mode |= (arg_mode & (MODE_DAEMON | MODE_FOREGROUND | MODE_QUIET |
-				    MODE_VERBOSE | MODE_DEBUG ));
+
+	if (arg_mode & MODE_DAEMON) {
+		/* command line daemon mode inhibits foreground and debug modes mode */
+		global.mode &= ~(MODE_DEBUG | MODE_FOREGROUND);
+		global.mode |= (arg_mode & MODE_DAEMON);
+	}
+
+	global.mode |= (arg_mode & (MODE_QUIET | MODE_VERBOSE));
 
 	if ((global.mode & MODE_DEBUG) && (global.mode & (MODE_DAEMON | MODE_QUIET))) {
 		Warning("<debug> mode incompatible with <quiet> and <daemon>. Keeping <debug> only.\n");
@@ -727,6 +759,11 @@ void init(int argc, char **argv)
 		global.nbproc = 1;
 
 	swap_buffer = (char *)calloc(1, global.tune.bufsize);
+	sample_trash_buf1 = (char *)calloc(1, global.tune.bufsize);
+	sample_trash_buf2 = (char *)calloc(1, global.tune.bufsize);
+	get_http_auth_buff = (char *)calloc(1, global.tune.bufsize);
+	static_table_key = calloc(1, sizeof(*static_table_key) + global.tune.bufsize);
+
 
 	fdinfo = (struct fdinfo *)calloc(1,
 				       sizeof(struct fdinfo) * (global.maxsock));
@@ -742,9 +779,6 @@ void init(int argc, char **argv)
 
 	if (!(global.tune.options & GTUNE_USE_EPOLL))
 		disable_poller("epoll");
-
-	if (!(global.tune.options & GTUNE_USE_SEPOLL))
-		disable_poller("sepoll");
 
 	if (!(global.tune.options & GTUNE_USE_POLL))
 		disable_poller("poll");
@@ -817,7 +851,8 @@ static void deinit_sample_arg(struct arg *p)
 		p++;
 	}
 
-	free(p_back);
+	if (p_back != empty_arg_list)
+		free(p_back);
 }
 
 static void deinit_stick_rules(struct list *rules)
@@ -855,11 +890,12 @@ void deinit(void)
 	struct uri_auth *uap, *ua = NULL;
 	struct logsrv *log, *logb;
 	struct logformat_node *lf, *lfb;
-	struct ssl_conf *ssl_conf, *ssl_back;
+	struct bind_conf *bind_conf, *bind_back;
 	int i;
 
 	deinit_signals();
 	while (p) {
+		free(p->conf.file);
 		free(p->id);
 		free(p->check_req);
 		free(p->cookie_name);
@@ -1014,9 +1050,9 @@ void deinit(void)
 		while (s) {
 			s_next = s->next;
 
-			if (s->check) {
-				task_delete(s->check);
-				task_free(s->check);
+			if (s->check.task) {
+				task_delete(s->check.task);
+				task_free(s->check.task);
 			}
 
 			if (s->warmup) {
@@ -1026,39 +1062,36 @@ void deinit(void)
 
 			free(s->id);
 			free(s->cookie);
-			free(s->check_data);
+			free(s->check.bi);
+			free(s->check.bo);
 			free(s);
 			s = s_next;
 		}/* end while(s) */
 
-		l = p->listen;
-		while (l) {
-			l_next = l->next;
+		list_for_each_entry_safe(l, l_next, &p->conf.listeners, by_fe) {
 			unbind_listener(l);
 			delete_listener(l);
-			if (l->ssl_conf) {
-				l->ssl_conf->ref_cnt--;
-				l->ssl_conf = NULL;
-			}
+			LIST_DEL(&l->by_fe);
+			LIST_DEL(&l->by_bind);
 			free(l->name);
 			free(l->counters);
 			free(l);
-			l = l_next;
-		}/* end while(l) */
-
-		ssl_back = ssl_conf = NULL;
-#ifdef USE_OPENSSL
-		/* Release unused SSL configs.
-		 */
-		list_for_each_entry_safe(ssl_conf, ssl_back, &p->conf.ssl_bind, by_fe) {
-			ssl_sock_free_all_ctx(ssl_conf);
-			free(ssl_conf->ciphers);
-			free(ssl_conf->file);
-			free(ssl_conf->arg);
-			LIST_DEL(&ssl_conf->by_fe);
-			free(ssl_conf);
 		}
+
+		/* Release unused SSL configs. */
+		list_for_each_entry_safe(bind_conf, bind_back, &p->conf.bind, by_fe) {
+#ifdef USE_OPENSSL
+			ssl_sock_free_all_ctx(bind_conf);
+			free(bind_conf->ca_file);
+			free(bind_conf->ciphers);
+			free(bind_conf->ecdhe);
+			free(bind_conf->crl_file);
 #endif /* USE_OPENSSL */
+			free(bind_conf->file);
+			free(bind_conf->arg);
+			LIST_DEL(&bind_conf->by_fe);
+			free(bind_conf);
+		}
 
 		free(p->desc);
 		free(p->fwdfor_hdr_name);
@@ -1114,6 +1147,8 @@ void deinit(void)
 	}
 
 	pool_destroy2(pool2_session);
+	pool_destroy2(pool2_connection);
+	pool_destroy2(pool2_buffer);
 	pool_destroy2(pool2_channel);
 	pool_destroy2(pool2_requri);
 	pool_destroy2(pool2_task);
@@ -1166,6 +1201,7 @@ void run_poll_loop()
 
 		/* The poller will ensure it returns around <next> */
 		cur_poller.poll(&cur_poller, next);
+		fd_process_spec_events();
 	}
 }
 
@@ -1424,6 +1460,13 @@ int main(int argc, char **argv)
 			}
 			relative_pid++; /* each child will get a different one */
 		}
+
+#ifdef USE_CPU_AFFINITY
+		if (proc < global.nbproc &&  /* child */
+		    proc < 32 &&             /* only the first 32 processes may be pinned */
+		    global.cpu_map[proc])    /* only do this if the process has a CPU map */
+			sched_setaffinity(0, sizeof(unsigned long), (void *)&global.cpu_map[proc]);
+#endif
 		/* close the pidfile both in children and father */
 		if (pidfd >= 0) {
 			//lseek(pidfd, 0, SEEK_SET);  /* debug: emulate eglibc bug */

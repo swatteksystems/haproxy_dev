@@ -26,7 +26,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <common/chunk.h>
 #include <common/config.h>
+#include <common/memory.h>
 
 
 struct buffer {
@@ -37,7 +39,9 @@ struct buffer {
 	char data[0];                   /* <size> bytes */
 };
 
+extern struct pool_head *pool2_buffer;
 
+int init_buffer();
 int buffer_replace2(struct buffer *b, char *pos, char *end, const char *str, int len);
 int buffer_insert_line2(struct buffer *b, char *pos, const char *str, int len);
 void buffer_dump(FILE *o, struct buffer *b, int from, int to);
@@ -52,6 +56,7 @@ void buffer_bounce_realign(struct buffer *buf);
  * pointer. It is written so that it is optimal when <ofs> is a const. It is
  * written as a macro instead of an inline function so that the compiler knows
  * when it can optimize out the sign test on <ofs> when passed an unsigned int.
+ * Note that callers MUST cast <ofs> to int if they expect negative values.
  */
 #define b_ptr(b, ofs) \
 	({            \
@@ -349,6 +354,60 @@ static inline void buffer_flush(struct buffer *buf)
 static inline int buffer_replace(struct buffer *b, char *pos, char *end, const char *str)
 {
 	return buffer_replace2(b, pos, end, str, strlen(str));
+}
+
+/* Tries to write char <c> into output data at buffer <b>. Supports wrapping.
+ * Data are truncated if buffer is full.
+ */
+static inline void bo_putchr(struct buffer *b, char c)
+{
+	if (buffer_len(b) == b->size)
+		return;
+	*b->p = c;
+	b->p = b_ptr(b, 1);
+	b->o++;
+}
+
+/* Tries to copy block <blk> into output data at buffer <b>. Supports wrapping.
+ * Data are truncated if buffer is too short.
+ */
+static inline void bo_putblk(struct buffer *b, const char *blk, int len)
+{
+	int cur_len = buffer_len(b);
+	int half;
+
+	if (len > b->size - cur_len)
+		len = (b->size - cur_len);
+	if (!len)
+		return;
+
+	half = buffer_contig_space(b);
+	if (half > len)
+		half = len;
+
+	memcpy(b->p, blk, half);
+	b->p = b_ptr(b, half);
+	if (len > half) {
+		memcpy(b->p, blk, len - half);
+		b->p = b_ptr(b, half);
+	}
+	b->o += len;
+}
+
+/* Tries to copy string <str> into output data at buffer <b>. Supports wrapping.
+ * Data are truncated if buffer is too short.
+ */
+static inline void bo_putstr(struct buffer *b, const char *str)
+{
+	return bo_putblk(b, str, strlen(str));
+}
+
+/* Tries to copy chunk <chk> into output data at buffer <b>. Supports wrapping.
+ * Data are truncated if buffer is too short.
+ */
+static inline void bo_putchk(struct buffer *b, const struct chunk *chk)
+{
+	return bo_putblk(b, chk->str, chk->len);
 }
 
 #endif /* _COMMON_BUFFER_H */

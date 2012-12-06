@@ -57,9 +57,11 @@ enum {
 	LOG_FMT_PID,
 	LOG_FMT_DATE,
 	LOG_FMT_DATEGMT,
+	LOG_FMT_DATELOCAL,
 	LOG_FMT_TS,
 	LOG_FMT_MS,
 	LOG_FMT_FRONTEND,
+	LOG_FMT_FRONTEND_XPRT,
 	LOG_FMT_BACKEND,
 	LOG_FMT_SERVER,
 	LOG_FMT_BYTES,
@@ -90,6 +92,8 @@ enum {
 	LOG_FMT_REQ,
 	LOG_FMT_HOSTNAME,
 	LOG_FMT_UNIQUEID,
+	LOG_FMT_SSL_CIPHER,
+	LOG_FMT_SSL_VERSION,
 };
 
 /* enum for parse_logformat */
@@ -130,6 +134,7 @@ struct logformat_node {
 #define LW_RSPHDR	2048	/* response header(s) */
 #define LW_BCKIP	4096	/* backend IP */
 #define LW_FRTIP 	8192	/* frontend IP */
+#define LW_XPRT		16384	/* transport layer information (eg: SSL) */
 
 struct logsrv {
 	struct list list;

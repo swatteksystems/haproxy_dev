@@ -23,16 +23,20 @@
 #define _PROTO_SSL_SOCK_H
 #include <openssl/ssl.h>
 
-#include <types/protocols.h>
+#include <types/connection.h>
+#include <types/listener.h>
+#include <types/proxy.h>
 #include <types/stream_interface.h>
 
-extern struct data_ops ssl_sock;
+extern struct xprt_ops ssl_sock;
 int ssl_sock_handshake(struct connection *conn, unsigned int flag);
-int ssl_sock_load_cert(char *path, struct ssl_conf *ssl_conf, struct proxy *proxy);
-int ssl_sock_prepare_ctx(struct ssl_conf *ssl_conf, SSL_CTX *ctx, struct proxy *proxy);
-void ssl_sock_free_certs(struct ssl_conf *ssl_conf);
-int ssl_sock_prepare_all_ctx(struct ssl_conf *ssl_conf, struct proxy *px);
-void ssl_sock_free_all_ctx(struct ssl_conf *ssl_conf);
+int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy *proxy);
+void ssl_sock_free_certs(struct bind_conf *bind_conf);
+int ssl_sock_prepare_all_ctx(struct bind_conf *bind_conf, struct proxy *px);
+int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *px);
+void ssl_sock_free_all_ctx(struct bind_conf *bind_conf);
+const char *ssl_sock_get_cipher_name(struct connection *conn);
+const char *ssl_sock_get_proto_version(struct connection *conn);
 
 #endif /* _PROTO_SSL_SOCK_H */
 

@@ -180,9 +180,19 @@ extern int ishex(char s);
 
 /*
  * Return integer equivalent of character <c> for a hex digit (0-9, a-f, A-F),
- * otherwise -1.
+ * otherwise -1. This compact form helps gcc produce efficient code.
  */
-extern int hex2i(int c);
+static inline int hex2i(int c)
+{
+	if ((unsigned char)(c -= '0') > 9) {
+		if ((unsigned char)(c -= 'A' - '0') > 5 &&
+		    (unsigned char)(c -= 'a' - 'A') > 5)
+			c = -11;
+		c += 10;
+	}
+	return c;
+}
+
 
 /*
  * Checks <name> for invalid characters. Valid chars are [A-Za-z0-9_:.-]. If an
@@ -509,6 +519,17 @@ static inline unsigned int div64_32(unsigned long long o1, unsigned int o2)
 	return result;
 }
 
+/* Simple popcount implementation. It returns the number of ones in a word */
+static inline unsigned int popcount(unsigned int a)
+{
+	unsigned int cnt;
+	for (cnt = 0; a; a >>= 1) {
+		if (a & 1)
+			cnt++;
+	}
+	return cnt;
+}
+
 /* copies at most <n> characters from <src> and always terminates with '\0' */
 char *my_strndup(const char *src, int n);
 
@@ -560,6 +581,12 @@ static inline unsigned int __full_hash(unsigned int a)
 	 * by a large prime close to 3/4 of the tree.
 	 */
 	return a * 3221225473U;
+}
+
+/* sets the address family to AF_UNSPEC so that is_addr() does not match */
+static inline void clear_addr(struct sockaddr_storage *addr)
+{
+	addr->ss_family = AF_UNSPEC;
 }
 
 /* returns non-zero if addr has a valid and non-null IPv4 or IPv6 address,
@@ -660,6 +687,9 @@ char *human_time(int t, short hz_div);
 
 extern const char *monthname[];
 
+/* numeric timezone (that is, the hour and minute offset from UTC) */
+char localtimezone[6];
+
 /* date2str_log: write a date in the format :
  * 	sprintf(str, "%02d/%s/%04d:%02d:%02d:%02d.%03d",
  *		tm.tm_mday, monthname[tm.tm_mon], tm.tm_year+1900,
@@ -676,6 +706,13 @@ char *date2str_log(char *dest, struct tm *tm, struct timeval *date, size_t size)
  * NULL if there isn't enough space.
  */
 char *gmt2str_log(char *dst, struct tm *tm, size_t size);
+
+/* localdate2str_log: write a date in the format :
+ * "%02d/%s/%04d:%02d:%02d:%02d +0000(local timezone)" without using snprintf
+ * return a pointer to the last char written (\0) or
+ * NULL if there isn't enough space.
+ */
+char *localdate2str_log(char *dst, struct tm *tm, size_t size);
 
 /* Dynamically allocates a string of the proper length to hold the formatted
  * output. NULL is returned on error. The caller is responsible for freeing the
@@ -694,7 +731,8 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size);
  * This means that <err> must be initialized to NULL before first invocation.
  * The return value also holds the allocated string, which eases error checking
  * and immediate consumption. If the output pointer is not used, NULL must be
- * passed instead and it will be ignored.
+ * passed instead and it will be ignored. The returned message will then also
+ * be NULL so that the caller does not have to bother with freeing anything.
  *
  * It is also convenient to use it without any free except the last one :
  *    err = NULL;
@@ -706,6 +744,15 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size);
 char *memprintf(char **out, const char *format, ...)
 	__attribute__ ((format(printf, 2, 3)));
 
+/* Used to add <level> spaces before each line of <out>, unless there is only one line.
+ * The input argument is automatically freed and reassigned. The result will have to be
+ * freed by the caller.
+ * Example of use :
+ *   parse(cmd, &err); (callee: memprintf(&err, ...))
+ *   fprintf(stderr, "Parser said: %s\n", indent_error(&err));
+ *   free(err);
+ */
+char *indent_msg(char **out, int level);
 
 /* debugging macro to emit messages using write() on fd #-1 so that strace sees
  * them.

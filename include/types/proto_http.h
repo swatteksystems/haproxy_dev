@@ -82,8 +82,9 @@
 #define TX_CON_CLO_SET  0x00400000	/* "connection: close" is now set */
 #define TX_CON_KAL_SET  0x00800000	/* "connection: keep-alive" is now set */
 
-/* Unused: 0x1000000, 0x2000000 */
+/* Unused: 0x1000000 */
 
+#define TX_HDR_CONN_UPG 0x02000000	/* The "Upgrade" token was found in the "Connection" header */
 #define TX_WAIT_NEXT_RQ	0x04000000	/* waiting for the second request to start, use keep-alive timeout */
 
 #define TX_HDR_CONN_PRS	0x08000000	/* "connection" header already parsed (req or res), results below */
@@ -166,7 +167,7 @@
 #define HTTP_MSG_100_SENT     28 // parsing body after a 100-Continue was sent
 #define HTTP_MSG_CHUNK_SIZE   29 // parsing the chunk size (RFC2616 #3.6.1)
 #define HTTP_MSG_DATA         30 // skipping data chunk / content-length data
-#define HTTP_MSG_DATA_CRLF    31 // skipping CRLF after data chunk
+#define HTTP_MSG_CHUNK_CRLF   31 // skipping CRLF after data chunk
 #define HTTP_MSG_TRAILERS     32 // trailers (post-data entity headers)
 
 /* we enter this state when we've received the end of the current message */
@@ -204,6 +205,7 @@ enum {
 	REDIRECT_TYPE_NONE = 0,         /* no redirection */
 	REDIRECT_TYPE_LOCATION,         /* location redirect */
 	REDIRECT_TYPE_PREFIX,           /* prefix redirect */
+	REDIRECT_TYPE_SCHEME,           /* scheme redirect (eg: switch from http to https) */
 };
 
 /* Perist types (force-persist, ignore-persist) */
@@ -305,7 +307,7 @@ enum {
 struct http_msg {
 	unsigned int msg_state;                /* where we are in the current message parsing */
 	unsigned int flags;                    /* flags describing the message (HTTP version, ...) */
-	struct channel *buf;                   /* pointer to the buffer which holds the message */
+	struct channel *chn;                   /* pointer to the channel transporting the message */
 	unsigned int next;                     /* pointer to next byte to parse, relative to buf->p */
 	unsigned int sov;                      /* current header: start of value */
 	unsigned int eoh;                      /* End Of Headers, relative to buffer */

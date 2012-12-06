@@ -27,8 +27,11 @@
 
 #include <common/config.h>
 
+#include <types/listener.h>
+#include <types/obj_type.h>
+#include <types/protocol.h>
+
 /* referenced below */
-struct protocol;
 struct connection;
 struct buffer;
 struct pipe;
@@ -36,7 +39,6 @@ struct server;
 struct proxy;
 struct si_applet;
 struct task;
-struct listener;
 
 /* Polling flags that are manipulated by I/O callbacks and handshake callbacks
  * indicate what they expect from a file descriptor at each layer. For each
@@ -54,47 +56,50 @@ struct listener;
  * - Stopping an I/O event consists in ANDing with ~1.
  * - Polling for an I/O event consists in ORing with ~3.
  *
- * The last computed state is remembered in CO_FL_CURR_* so that differential
+ * The last ENA state is remembered in CO_FL_CURR_* so that differential
  * changes can be applied. After bits are applied, the POLL status bits are
  * cleared so that it is possible to detect when an EAGAIN was encountered. For
  * pollers that do not support speculative I/O, POLLED is the same as ENABLED
  * and the POL flag can safely be ignored. However it makes a difference for
  * the connection handler.
  *
- * The ENA flags are per-layer (one pair for SOCK, another one for DATA).
- * The POL flags are only for the socket layer since they indicate that EAGAIN
- * was encountered. Thus, the DATA layer uses its own ENA flag and the socket
- * layer's POL flag.
+ * The ENA flags are per-layer (one pair for SOCK, another one for DATA). The
+ * POL flags are irrelevant to these layers and only reflect the fact that
+ * EAGAIN was encountered, they're materialised by the CO_FL_WAIT_* connection
+ * flags. POL flags always indicate a polling change because it is assumed that
+ * the poller uses a cache and does not always poll.
  */
 
 /* flags for use in connection->flags */
 enum {
-	CO_FL_NONE          = 0x00000000,
-	CO_FL_ERROR         = 0x00000001,  /* a fatal error was reported     */
-	CO_FL_CONNECTED     = 0x00000002,  /* the connection is now established */
-	CO_FL_WAIT_L4_CONN  = 0x00000004,  /* waiting for L4 to be connected */
-	CO_FL_WAIT_L6_CONN  = 0x00000008,  /* waiting for L6 to be connected (eg: SSL) */
+	CO_FL_NONE          = 0x00000000,  /* Just for initialization purposes */
 
-	CO_FL_NOTIFY_SI     = 0x00000010,  /* notify stream interface about changes */
+	/* Do not change these values without updating conn_*_poll_changes() ! */
+	CO_FL_SOCK_RD_ENA   = 0x00000001,  /* receiving handshakes is allowed */
+	CO_FL_DATA_RD_ENA   = 0x00000002,  /* receiving data is allowed */
+	CO_FL_CURR_RD_ENA   = 0x00000004,  /* receiving is currently allowed */
+	CO_FL_WAIT_RD       = 0x00000008,  /* receiving needs to poll first */
 
-	/* flags below are used for connection handshakes */
-	CO_FL_SI_SEND_PROXY = 0x00000020,  /* send a valid PROXY protocol header */
-	CO_FL_SSL_WAIT_HS   = 0x00000040,  /* wait for an SSL handshake to complete */
-	CO_FL_ACCEPT_PROXY  = 0x00000080,  /* send a valid PROXY protocol header */
+	CO_FL_SOCK_WR_ENA   = 0x00000010,  /* sending handshakes is desired */
+	CO_FL_DATA_WR_ENA   = 0x00000020,  /* sending data is desired */
+	CO_FL_CURR_WR_ENA   = 0x00000040,  /* sending is currently desired */
+	CO_FL_WAIT_WR       = 0x00000080,  /* sending needs to poll first */
 
-	/* below we have all handshake flags grouped into one */
-	CO_FL_HANDSHAKE     = CO_FL_SI_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY,
-
-	CO_FL_INIT_SESS     = 0x00000800,  /* initialize a session before using data */
-
-	/* when any of these flags is set, polling is defined by socket-layer
-	 * operations, as opposed to data-layer.
+	/* These flags are used by data layers to indicate they had to stop
+	 * sending data because a buffer was empty (WAIT_DATA) or stop receiving
+	 * data because a buffer was full (WAIT_ROOM). The connection handler
+	 * clears them before first calling the I/O and data callbacks.
 	 */
-	CO_FL_POLL_SOCK     = CO_FL_HANDSHAKE | CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN,
+	CO_FL_WAIT_DATA     = 0x00000400,  /* data source is empty */
+	CO_FL_WAIT_ROOM     = 0x00000800,  /* data sink is full */
 
 	/* These flags are used to report whether the from/to addresses are set or not */
-	CO_FL_ADDR_FROM_SET = 0x00004000,  /* addr.from is set */
-	CO_FL_ADDR_TO_SET   = 0x00008000,  /* addr.to is set */
+	CO_FL_ADDR_FROM_SET = 0x00001000,  /* addr.from is set */
+	CO_FL_ADDR_TO_SET   = 0x00002000,  /* addr.to is set */
+
+	/* flags indicating what event type the data layer is interested in */
+	CO_FL_INIT_DATA     = 0x00004000,  /* initialize the data layer before using it */
+	CO_FL_WAKE_DATA     = 0x00008000,  /* wake-up data layer upon activity at the transport layer */
 
 	/* flags used to remember what shutdown have been performed/reported */
 	CO_FL_DATA_RD_SH    = 0x00010000,  /* DATA layer was notified about shutr/read0 */
@@ -102,113 +107,98 @@ enum {
 	CO_FL_SOCK_RD_SH    = 0x00040000,  /* SOCK layer was notified about shutr/read0 */
 	CO_FL_SOCK_WR_SH    = 0x00080000,  /* SOCK layer asked for shutw */
 
-	/* NOTE: do not change the values of any of the flags below, they're
-	 * used with masks and bit shifts to quickly detect multiple changes.
+	/* flags used to report connection status and errors */
+	CO_FL_ERROR         = 0x00100000,  /* a fatal error was reported     */
+	CO_FL_CONNECTED     = 0x00200000,  /* the connection is now established */
+	CO_FL_WAIT_L4_CONN  = 0x00400000,  /* waiting for L4 to be connected */
+	CO_FL_WAIT_L6_CONN  = 0x00800000,  /* waiting for L6 to be connected (eg: SSL) */
+
+	/* synthesis of the flags above */
+	CO_FL_CONN_STATE    = 0x00FF0000,  /* all shut/connected flags */
+
+	/*** All the flags below are used for connection handshakes. Any new
+	 * handshake should be added after this point, and CO_FL_HANDSHAKE
+	 * should be updated.
 	 */
+	CO_FL_SI_SEND_PROXY = 0x01000000,  /* send a valid PROXY protocol header */
+	CO_FL_SSL_WAIT_HS   = 0x02000000,  /* wait for an SSL handshake to complete */
+	CO_FL_ACCEPT_PROXY  = 0x04000000,  /* receive a valid PROXY protocol header */
+	CO_FL_LOCAL_SPROXY  = 0x08000000,  /* send a valid local PROXY protocol header */
 
-	/* These flags are used by data layers to indicate to indicate they had
-	 * to stop sending data because a buffer was empty (WAIT_DATA) or stop
-	 * receiving data because a buffer was full (WAIT_ROOM). The connection
-	 * handler clears them before first calling the I/O and data callbacks.
+	/* below we have all handshake flags grouped into one */
+	CO_FL_HANDSHAKE     = CO_FL_SI_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY | CO_FL_LOCAL_SPROXY,
+
+	/* when any of these flags is set, polling is defined by socket-layer
+	 * operations, as opposed to data-layer. Transport is explicitly not
+	 * mentionned here to avoid any confusion, since it can be the same
+	 * as DATA or SOCK on some implementations.
 	 */
-	CO_FL_WAIT_DATA     = 0x00100000,  /* data source is empty */
-	CO_FL_WAIT_ROOM     = 0x00200000,  /* data sink is full */
+	CO_FL_POLL_SOCK     = CO_FL_HANDSHAKE | CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN,
 
-	/* These flags are used by both socket-level and data-level callbacks
-	 * to indicate that they had to stop receiving or sending because a
-	 * socket-level operation returned EAGAIN. While setting these flags
-	 * is not always absolutely mandatory (eg: when a reader estimates that
-	 * trying again soon without polling is OK), it is however forbidden to
-	 * set them without really attempting the I/O operation.
+	/* This last flag indicates that the transport layer is used (for instance
+	 * by logs) and must not be cleared yet. The last call to conn_xprt_close()
+	 * must be done after clearing this flag.
 	 */
-	CO_FL_WAIT_RD       = 0x00400000,  /* receiving needs to poll first */
-	CO_FL_WAIT_WR       = 0x00800000,  /* sending needs to poll first */
-
-	/* flags describing the DATA layer expectations regarding polling */
-	CO_FL_DATA_RD_ENA   = 0x01000000,  /* receiving is allowed */
-	CO_FL_DATA_WR_ENA   = 0x02000000,  /* sending is desired */
-
-	/* flags describing the SOCK layer expectations regarding polling */
-	CO_FL_SOCK_RD_ENA   = 0x04000000,  /* receiving is allowed */
-	CO_FL_SOCK_WR_ENA   = 0x08000000,  /* sending is desired */
-
-	/* flags storing the current polling state */
-	CO_FL_CURR_RD_ENA   = 0x10000000,  /* receiving is allowed */
-	CO_FL_CURR_WR_ENA   = 0x20000000,  /* sending is desired */
-	CO_FL_CURR_RD_POL   = 0x40000000,  /* receiving needs to poll first */
-	CO_FL_CURR_WR_POL   = 0x80000000,  /* sending needs to poll first */
+	CO_FL_XPRT_TRACKED  = 0x80000000,
 };
 
-/* target types */
-enum {
-	TARG_TYPE_NONE = 0,         /* no target set, pointer is NULL by definition */
-	TARG_TYPE_CLIENT,           /* target is a client, pointer is NULL by definition */
-	TARG_TYPE_PROXY,            /* target is a proxy   ; use address with the proxy's settings */
-	TARG_TYPE_SERVER,           /* target is a server  ; use address with server's and its proxy's settings */
-	TARG_TYPE_APPLET,           /* target is an applet ; use only the applet */
-	TARG_TYPE_TASK,             /* target is a task running an external applet */
-};
-
-
-/* data_ops describes data-layer operations for a connection. They generally
- * run over a socket-based control layer, but not always.
+/* xprt_ops describes transport-layer operations for a connection. They
+ * generally run over a socket-based control layer, but not always. Some
+ * of them are used for data transfer with the upper layer (rcv_*, snd_*)
+ * and the other ones are used to setup and release the transport layer.
  */
-struct data_ops {
+struct xprt_ops {
 	int  (*rcv_buf)(struct connection *conn, struct buffer *buf, int count); /* recv callback */
 	int  (*snd_buf)(struct connection *conn, struct buffer *buf, int flags); /* send callback */
 	int  (*rcv_pipe)(struct connection *conn, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
 	int  (*snd_pipe)(struct connection *conn, struct pipe *pipe); /* send-to-pipe callback */
 	void (*shutr)(struct connection *, int);    /* shutr function */
 	void (*shutw)(struct connection *, int);    /* shutw function */
-	void (*close)(struct connection *);         /* close the data channel on the connection */
-	int  (*init)(struct connection *conn);      /* initialize the data layer */
+	void (*close)(struct connection *);         /* close the transport layer */
+	int  (*init)(struct connection *conn);      /* initialize the transport layer */
 };
 
-/* app_cb describes read and write callbacks which are called upon detected I/O
- * activity at the data layer. These callbacks are supposed to make use of the
- * data_ops above to exchange data from/to buffers and pipes.
+/* data_cb describes the data layer's recv and send callbacks which are called
+ * when I/O activity was detected after the transport layer is ready. These
+ * callbacks are supposed to make use of the xprt_ops above to exchange data
+ * from/to buffers and pipes. The <wake> callback is used to report activity
+ * at the transport layer, which can be a connection opening/close, or any
+ * data movement. The <init> callback may be called by the connection handler
+ * at the end of a transport handshake, when it is about to transfer data and
+ * the data layer is not ready yet. Both <wake> and <init> may abort a connection
+ * by returning < 0.
  */
-struct app_cb {
-	void (*recv)(struct connection *conn);  /* application-layer recv callback */
-	void (*send)(struct connection *conn);  /* application-layer send callback */
-};
-
-/* a target describes what is on the remote side of the connection. */
-struct target {
-	int type;
-	union {
-		void *v;              /* pointer value, for any type */
-		struct proxy *p;      /* when type is TARG_TYPE_PROXY  */
-		struct server *s;     /* when type is TARG_TYPE_SERVER */
-		struct si_applet *a;  /* when type is TARG_TYPE_APPLET */
-		struct task *t;       /* when type is TARG_TYPE_TASK */
-		struct listener *l;   /* when type is TARG_TYPE_CLIENT */
-	} ptr;
+struct data_cb {
+	void (*recv)(struct connection *conn);  /* data-layer recv callback */
+	void (*send)(struct connection *conn);  /* data-layer send callback */
+	int  (*wake)(struct connection *conn);  /* data-layer callback to report activity */
+	int  (*init)(struct connection *conn);  /* data-layer initialization */
 };
 
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
  * socket, and can also be made to an internal applet. It can support
- * several data schemes (applet, raw, ssl, ...). It can support several
+ * several transport schemes (applet, raw, ssl, ...). It can support several
  * connection control schemes, generally a protocol for socket-oriented
  * connections, but other methods for applets.
  */
 struct connection {
-	const struct data_ops *data;  /* operations at the data layer */
 	const struct protocol *ctrl;  /* operations at the socket layer */
-	const struct app_cb *app_cb;  /* application layer callbacks */
+	const struct xprt_ops *xprt;  /* operations at the transport layer */
+	const struct data_cb  *data;  /* data layer callbacks */
+	unsigned int flags;           /* CO_F_* */
+	int xprt_st;                  /* transport layer state, initialized to zero */
+	void *xprt_ctx;               /* general purpose pointer, initialized to NULL */
+	void *owner;                  /* pointer to upper layer's entity (eg: stream interface) */
 	union {                       /* definitions which depend on connection type */
 		struct {              /*** information used by socket-based connections ***/
 			int fd;       /* file descriptor for a stream driver when known */
 		} sock;
 	} t;
-	unsigned int flags;           /* CO_F_* */
-	int data_st;                  /* data layer state, initialized to zero */
-	void *data_ctx;               /* general purpose pointer, initialized to NULL */
-	struct target target;         /* the target to connect to (server, proxy, applet, ...) */
+	enum obj_type *target;        /* the target to connect to (server, proxy, applet, ...) */
 	struct {
 		struct sockaddr_storage from;	/* client address, or address to spoof when connecting to the server */
-		struct sockaddr_storage to;	/* address reached by the client if SN_FRT_ADDR_SET is set, or address to connect to */
+		struct sockaddr_storage to;	/* address reached by the client, or address to connect to */
 	} addr; /* addresses of the remote side, client for producer and server for consumer */
 };
 

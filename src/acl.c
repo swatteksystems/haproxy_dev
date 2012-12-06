@@ -108,7 +108,7 @@ acl_fetch_req_len(struct proxy *px, struct session *l4, void *l7, unsigned int o
 		return 0;
 
 	smp->type = SMP_T_UINT;
-	smp->data.uint = l4->req->buf.i;
+	smp->data.uint = l4->req->buf->i;
 	smp->flags = SMP_F_VOLATILE | SMP_F_MAY_CHANGE;
 	return 1;
 }
@@ -120,16 +120,16 @@ acl_fetch_ssl_hello_type(struct proxy *px, struct session *l4, void *l7, unsigne
 {
 	int hs_len;
 	int hs_type, bleft;
-	struct channel *b;
+	struct channel *chn;
 	const unsigned char *data;
 
 	if (!l4)
 		goto not_ssl_hello;
 
-	b = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
+	chn = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
 
-	bleft = b->buf.i;
-	data = (const unsigned char *)b->buf.p;
+	bleft = chn->buf->i;
+	data = (const unsigned char *)chn->buf->p;
 
 	if (!bleft)
 		goto too_short;
@@ -194,11 +194,11 @@ acl_fetch_req_ssl_ver(struct proxy *px, struct session *l4, void *l7, unsigned i
 		return 0;
 
 	msg_len = 0;
-	bleft = l4->req->buf.i;
+	bleft = l4->req->buf->i;
 	if (!bleft)
 		goto too_short;
 
-	data = (const unsigned char *)l4->req->buf.p;
+	data = (const unsigned char *)l4->req->buf->p;
 	if ((*data >= 0x14 && *data <= 0x17) || (*data == 0xFF)) {
 		/* SSLv3 header format */
 		if (bleft < 5)
@@ -266,8 +266,8 @@ acl_fetch_req_ssl_ver(struct proxy *px, struct session *l4, void *l7, unsigned i
 	 * all the part of the request which fits in a buffer is already
 	 * there.
 	 */
-	if (msg_len > buffer_max_len(l4->req) + l4->req->buf.data - l4->req->buf.p)
-		msg_len = buffer_max_len(l4->req) + l4->req->buf.data - l4->req->buf.p;
+	if (msg_len > buffer_max_len(l4->req) + l4->req->buf->data - l4->req->buf->p)
+		msg_len = buffer_max_len(l4->req) + l4->req->buf->data - l4->req->buf->p;
 
 	if (bleft < msg_len)
 		goto too_short;
@@ -324,16 +324,16 @@ acl_fetch_ssl_hello_sni(struct proxy *px, struct session *l4, void *l7, unsigned
                         const struct arg *args, struct sample *smp)
 {
 	int hs_len, ext_len, bleft;
-	struct channel *b;
+	struct channel *chn;
 	unsigned char *data;
 
 	if (!l4)
 		goto not_ssl_hello;
 
-	b = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
+	chn = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? l4->rep : l4->req;
 
-	bleft = b->buf.i;
-	data = (unsigned char *)b->buf.p;
+	bleft = chn->buf->i;
+	data = (unsigned char *)chn->buf->p;
 
 	/* Check for SSL/TLS Handshake */
 	if (!bleft)
@@ -488,6 +488,17 @@ int acl_match_str(struct sample *smp, struct acl_pattern *pattern)
 	icase = pattern->flags & ACL_PAT_F_IGNORE_CASE;
 	if ((icase && strncasecmp(pattern->ptr.str, smp->data.str.str, smp->data.str.len) == 0) ||
 	    (!icase && strncmp(pattern->ptr.str, smp->data.str.str, smp->data.str.len) == 0))
+		return ACL_PAT_PASS;
+	return ACL_PAT_FAIL;
+}
+
+/* NB: For two binaries buf to be identical, it is required that their lengths match */
+int acl_match_bin(struct sample *smp, struct acl_pattern *pattern)
+{
+	if (pattern->len != smp->data.str.len)
+		return ACL_PAT_FAIL;
+
+	if (memcmp(pattern->ptr.str, smp->data.str.str, smp->data.str.len) == 0)
 		return ACL_PAT_PASS;
 	return ACL_PAT_FAIL;
 }
@@ -765,7 +776,7 @@ int acl_match_ip(struct sample *smp, struct acl_pattern *pattern)
 		for (pos = 0; bits > 0; pos += 4, bits -= 32) {
 			v4 = *(uint32_t*)&v6->s6_addr[pos] ^ *(uint32_t*)&pattern->val.ipv6.addr.s6_addr[pos];
 			if (bits < 32)
-				v4 &= (~0U) << (32-bits);
+				v4 &= htonl((~0U) << (32-bits));
 			if (v4)
 				return ACL_PAT_FAIL;
 		}
@@ -804,8 +815,7 @@ int acl_parse_str(const char **text, struct acl_pattern *pattern, int *opaque, c
 
 		node = calloc(1, sizeof(*node) + len + 1);
 		if (!node) {
-			if (err)
-				memprintf(err, "out of memory while loading string pattern");
+			memprintf(err, "out of memory while loading string pattern");
 			return 0;
 		}
 		memcpy(node->key, *text, len + 1);
@@ -817,12 +827,48 @@ int acl_parse_str(const char **text, struct acl_pattern *pattern, int *opaque, c
 
 	pattern->ptr.str = strdup(*text);
 	if (!pattern->ptr.str) {
-		if (err)
-			memprintf(err, "out of memory while loading string pattern");
+		memprintf(err, "out of memory while loading string pattern");
 		return 0;
 	}
 	pattern->len = len;
 	return 1;
+}
+
+/* Parse a binary written in hexa. It is allocated. */
+int acl_parse_bin(const char **text, struct acl_pattern *pattern, int *opaque, char **err)
+{
+	int len;
+	const char *p = *text;
+	int i,j;
+
+	len  = strlen(p);
+	if (len%2) {
+		memprintf(err, "an even number of hex digit is expected");
+		return 0;
+	}
+
+	pattern->type = SMP_T_CBIN;
+	pattern->len = len >> 1;
+	pattern->ptr.str = malloc(pattern->len);
+	if (!pattern->ptr.str) {
+		memprintf(err, "out of memory while loading string pattern");
+		return 0;
+	}
+
+	i = j = 0;
+	while (j < pattern->len) {
+		if (!ishex(p[i++]))
+			goto bad_input;
+		if (!ishex(p[i++]))
+			goto bad_input;
+		pattern->ptr.str[j++] =  (hex2i(p[i-2]) << 4) + hex2i(p[i-1]);
+	}
+	return 1;
+
+bad_input:
+	memprintf(err, "an hex digit is expected (found '%c')", p[i-1]);
+	free(pattern->ptr.str);
+	return 0;
 }
 
 /* Parse and concatenate all further strings into one. */
@@ -839,8 +885,7 @@ acl_parse_strcat(const char **text, struct acl_pattern *pattern, int *opaque, ch
 	pattern->type = SMP_T_CSTR;
 	pattern->ptr.str = s = calloc(1, len);
 	if (!pattern->ptr.str) {
-		if (err)
-			memprintf(err, "out of memory while loading pattern");
+		memprintf(err, "out of memory while loading pattern");
 		return 0;
 	}
 
@@ -867,16 +912,14 @@ int acl_parse_reg(const char **text, struct acl_pattern *pattern, int *opaque, c
 	preg = calloc(1, sizeof(regex_t));
 
 	if (!preg) {
-		if (err)
-			memprintf(err, "out of memory while loading pattern");
+		memprintf(err, "out of memory while loading pattern");
 		return 0;
 	}
 
 	icase = (pattern->flags & ACL_PAT_F_IGNORE_CASE) ? REG_ICASE : 0;
 	if (regcomp(preg, *text, REG_EXTENDED | REG_NOSUB | icase) != 0) {
 		free(preg);
-		if (err)
-			memprintf(err, "regex '%s' is invalid", *text);
+		memprintf(err, "regex '%s' is invalid", *text);
 		return 0;
 	}
 
@@ -914,8 +957,7 @@ int acl_parse_int(const char **text, struct acl_pattern *pattern, int *opaque, c
 		case STD_OP_LT: *opaque = 3; break;
 		case STD_OP_LE: *opaque = 4; break;
 		default:
-			if (err)
-				memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
+			memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
 			return 0;
 		}
 
@@ -942,8 +984,7 @@ int acl_parse_int(const char **text, struct acl_pattern *pattern, int *opaque, c
 
 	if (last && *opaque >= 1 && *opaque <= 4) {
 		/* having a range with a min or a max is absurd */
-		if (err)
-			memprintf(err, "integer range '%s' specified with a comparison operator", text[skip]);
+		memprintf(err, "integer range '%s' specified with a comparison operator", text[skip]);
 		return 0;
 	}
 
@@ -1007,8 +1048,7 @@ int acl_parse_dotted_ver(const char **text, struct acl_pattern *pattern, int *op
 		case STD_OP_LT: *opaque = 3; break;
 		case STD_OP_LE: *opaque = 4; break;
 		default:
-			if (err)
-				memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
+			memprintf(err, "'%s' is neither a number nor a supported operator", ptr);
 			return 0;
 		}
 
@@ -1048,8 +1088,7 @@ int acl_parse_dotted_ver(const char **text, struct acl_pattern *pattern, int *op
 
 	if (last && *opaque >= 1 && *opaque <= 4) {
 		/* having a range with a min or a max is absurd */
-		if (err)
-			memprintf(err, "version range '%s' specified with a comparison operator", text[skip]);
+		memprintf(err, "version range '%s' specified with a comparison operator", text[skip]);
 		return 0;
 	}
 
@@ -1103,8 +1142,7 @@ int acl_parse_ip(const char **text, struct acl_pattern *pattern, int *opaque, ch
 			/* FIXME: insert <addr>/<mask> into the tree here */
 			node = calloc(1, sizeof(*node) + 4); /* reserve 4 bytes for IPv4 address */
 			if (!node) {
-				if (err)
-					memprintf(err, "out of memory while loading IPv4 pattern");
+				memprintf(err, "out of memory while loading IPv4 pattern");
 				return 0;
 			}
 			memcpy(node->key, &pattern->val.ipv4.addr, 4); /* network byte order */
@@ -1122,8 +1160,7 @@ int acl_parse_ip(const char **text, struct acl_pattern *pattern, int *opaque, ch
 		return 1;
 	}
 	else {
-		if (err)
-			memprintf(err, "'%s' is not a valid IPv4 or IPv6 address", *text);
+		memprintf(err, "'%s' is not a valid IPv4 or IPv6 address", *text);
 		return 0;
 	}
 }
@@ -1232,10 +1269,10 @@ static struct acl_expr *prune_acl_expr(struct acl_expr *expr)
 			arg->data.str.str = NULL;
 			arg->unresolved = 0;
 		}
-		arg++;
 	}
 
-	free(expr->args);
+	if (expr->args != empty_arg_list)
+		free(expr->args);
 	expr->kw->use_cnt--;
 	return expr;
 }
@@ -1270,9 +1307,9 @@ static int acl_read_patterns_from_file(	struct acl_keyword *aclkw,
 	opaque = 0;
 	pattern = NULL;
 	args[1] = "";
-	while (fgets(trash, trashlen, file) != NULL) {
+	while (fgets(trash.str, trash.size, file) != NULL) {
 		line++;
-		c = trash;
+		c = trash.str;
 
 		/* ignore lines beginning with a dash */
 		if (*c == '#')
@@ -1349,15 +1386,13 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
 
 	aclkw = find_acl_kw(args[0]);
 	if (!aclkw || !aclkw->parse) {
-		if (err)
-			memprintf(err, "unknown ACL keyword '%s'", *args);
+		memprintf(err, "unknown ACL keyword '%s'", *args);
 		goto out_return;
 	}
 
 	expr = (struct acl_expr *)calloc(1, sizeof(*expr));
 	if (!expr) {
-		if (err)
-			memprintf(err, "out of memory when parsing ACL expression");
+		memprintf(err, "out of memory when parsing ACL expression");
 		goto out_return;
 	}
 
@@ -1365,6 +1400,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
 	aclkw->use_cnt++;
 	LIST_INIT(&expr->patterns);
 	expr->pattern_tree = EB_ROOT_UNIQUE;
+	expr->args = empty_arg_list;
 
 	arg = strchr(args[0], '(');
 	if (aclkw->arg_mask) {
@@ -1376,8 +1412,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
 			arg++;
 			end = strchr(arg, ')');
 			if (!end) {
-				if (err)
-					memprintf(err, "missing closing ')' after arguments to ACL keyword '%s'", aclkw->kw);
+				memprintf(err, "missing closing ')' after arguments to ACL keyword '%s'", aclkw->kw);
 				goto out_free_expr;
 			}
 
@@ -1390,17 +1425,18 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
 					       err, NULL, NULL);
 			if (nbargs < 0) {
 				/* note that make_arg_list will have set <err> here */
-				if (err)
-					memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
+				memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
 				goto out_free_expr;
 			}
+
+			if (!expr->args)
+				expr->args = empty_arg_list;
 
 			if (aclkw->val_args && !aclkw->val_args(expr->args, err)) {
 				/* invalid keyword argument, error must have been
 				 * set by val_args().
 				 */
-				if (err)
-					memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
+				memprintf(err, "in argument to '%s', %s", aclkw->kw, *err);
 				goto out_free_expr;
 			}
 		}
@@ -1412,8 +1448,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
 			 * the current one later.
 			 */
 			if (type != ARGT_FE && type != ARGT_BE && type != ARGT_TAB) {
-				if (err)
-					memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
+				memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
 				goto out_free_expr;
 			}
 
@@ -1430,16 +1465,14 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
 		}
 		else if (ARGM(aclkw->arg_mask)) {
 			/* there were some mandatory arguments */
-			if (err)
-				memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
+			memprintf(err, "ACL keyword '%s' expects %d arguments", aclkw->kw, ARGM(aclkw->arg_mask));
 			goto out_free_expr;
 		}
 	}
 	else {
 		if (arg) {
 			/* no argument expected */
-			if (err)
-				memprintf(err, "ACL keyword '%s' takes no argument", aclkw->kw);
+			memprintf(err, "ACL keyword '%s' takes no argument", aclkw->kw);
 			goto out_free_expr;
 		}
 	}
@@ -1475,8 +1508,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err)
 		int ret;
 		pattern = (struct acl_pattern *)calloc(1, sizeof(*pattern));
 		if (!pattern) {
-			if (err)
-				memprintf(err, "out of memory when parsing ACL pattern");
+			memprintf(err, "out of memory when parsing ACL pattern");
 			goto out_free_expr;
 		}
 		pattern->flags = patflags;
@@ -1535,8 +1567,7 @@ struct acl *parse_acl(const char **args, struct list *known_acl, char **err)
 	const char *pos;
 
 	if (**args && (pos = invalid_char(*args))) {
-		if (err)
-			memprintf(err, "invalid character in ACL name : '%c'", *pos);
+		memprintf(err, "invalid character in ACL name : '%c'", *pos);
 		goto out_return;
 	}
 
@@ -1566,14 +1597,12 @@ struct acl *parse_acl(const char **args, struct list *known_acl, char **err)
 	if (!cur_acl) {
 		name = strdup(args[0]);
 		if (!name) {
-			if (err)
-				memprintf(err, "out of memory when parsing ACL");
+			memprintf(err, "out of memory when parsing ACL");
 			goto out_free_acl_expr;
 		}
 		cur_acl = (struct acl *)calloc(1, sizeof(*cur_acl));
 		if (cur_acl == NULL) {
-			if (err)
-				memprintf(err, "out of memory when parsing ACL");
+			memprintf(err, "out of memory when parsing ACL");
 			goto out_free_name;
 		}
 
@@ -1644,8 +1673,7 @@ struct acl *find_acl_default(const char *acl_name, struct list *known_acl, char 
 	}
 
 	if (default_acl_list[index].name == NULL) {
-		if (err)
-			memprintf(err, "no such ACL : '%s'", acl_name);
+		memprintf(err, "no such ACL : '%s'", acl_name);
 		return NULL;
 	}
 
@@ -1657,15 +1685,13 @@ struct acl *find_acl_default(const char *acl_name, struct list *known_acl, char 
 
 	name = strdup(acl_name);
 	if (!name) {
-		if (err)
-			memprintf(err, "out of memory when building default ACL '%s'", acl_name);
+		memprintf(err, "out of memory when building default ACL '%s'", acl_name);
 		goto out_free_acl_expr;
 	}
 
 	cur_acl = (struct acl *)calloc(1, sizeof(*cur_acl));
 	if (cur_acl == NULL) {
-		if (err)
-			memprintf(err, "out of memory when building default ACL '%s'", acl_name);
+		memprintf(err, "out of memory when building default ACL '%s'", acl_name);
 		goto out_free_name;
 	}
 
@@ -1721,8 +1747,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
 
 	cond = (struct acl_cond *)calloc(1, sizeof(*cond));
 	if (cond == NULL) {
-		if (err)
-			memprintf(err, "out of memory when parsing condition");
+		memprintf(err, "out of memory when parsing condition");
 		goto out_return;
 	}
 
@@ -1765,15 +1790,13 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
 				arg_end++;
 
 			if (!*args[arg_end]) {
-				if (err)
-					memprintf(err, "missing closing '}' in condition");
+				memprintf(err, "missing closing '}' in condition");
 				goto out_free_suite;
 			}
 
 			args_new = calloc(1, (arg_end - arg + 1) * sizeof(*args_new));
 			if (!args_new) {
-				if (err)
-					memprintf(err, "out of memory when parsing condition");
+				memprintf(err, "out of memory when parsing condition");
 				goto out_free_suite;
 			}
 
@@ -1807,8 +1830,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
 
 		cur_term = (struct acl_term *)calloc(1, sizeof(*cur_term));
 		if (cur_term == NULL) {
-			if (err)
-				memprintf(err, "out of memory when parsing condition");
+			memprintf(err, "out of memory when parsing condition");
 			goto out_free_suite;
 		}
 
@@ -1819,8 +1841,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int p
 		if (!cur_suite) {
 			cur_suite = (struct acl_term_suite *)calloc(1, sizeof(*cur_suite));
 			if (cur_term == NULL) {
-				if (err)
-					memprintf(err, "out of memory when parsing condition");
+				memprintf(err, "out of memory when parsing condition");
 				goto out_free_term;
 			}
 			LIST_INIT(&cur_suite->terms);
@@ -1867,8 +1888,7 @@ struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, co
 		args++;
 	}
 	else {
-		if (err)
-			memprintf(err, "conditions must start with either 'if' or 'unless'");
+		memprintf(err, "conditions must start with either 'if' or 'unless'");
 		return NULL;
 	}
 
@@ -2062,24 +2082,22 @@ acl_find_targets(struct proxy *p)
 
 	list_for_each_entry(acl, &p->acl, list) {
 		list_for_each_entry(expr, &acl->expr, list) {
-			for (arg = expr->args; arg; arg++) {
-				if (arg->type == ARGT_STOP)
-					break;
-				else if (!arg->unresolved)
+			for (arg = expr->args; arg && arg->type != ARGT_STOP; arg++) {
+				if (!arg->unresolved)
 					continue;
 				else if (arg->type == ARGT_SRV) {
 					struct proxy *px;
 					struct server *srv;
 					char *pname, *sname;
 
-					if (!expr->args->data.str.len) {
+					if (!arg->data.str.len) {
 						Alert("proxy %s: acl '%s' %s(): missing server name.\n",
 						      p->id, acl->name, expr->kw->kw);
 						cfgerr++;
 						continue;
 					}
 
-					pname = expr->args->data.str.str;
+					pname = arg->data.str.str;
 					sname = strrchr(pname, '/');
 
 					if (sname)
@@ -2108,17 +2126,17 @@ acl_find_targets(struct proxy *p)
 						continue;
 					}
 
-					free(expr->args->data.str.str);
-					expr->args->data.str.str = NULL;
+					free(arg->data.str.str);
+					arg->data.str.str = NULL;
 					arg->unresolved = 0;
-					expr->args->data.srv = srv;
+					arg->data.srv = srv;
 				}
 				else if (arg->type == ARGT_FE) {
 					struct proxy *prx = p;
 					char *pname = p->id;
 
-					if (expr->args->data.str.len) {
-						pname = expr->args->data.str.str;
+					if (arg->data.str.len) {
+						pname = arg->data.str.str;
 						prx = findproxy(pname, PR_CAP_FE);
 					}
 
@@ -2136,17 +2154,17 @@ acl_find_targets(struct proxy *p)
 						continue;
 					}
 
-					free(expr->args->data.str.str);
-					expr->args->data.str.str = NULL;
+					free(arg->data.str.str);
+					arg->data.str.str = NULL;
 					arg->unresolved = 0;
-					expr->args->data.prx = prx;
+					arg->data.prx = prx;
 				}
 				else if (arg->type == ARGT_BE) {
 					struct proxy *prx = p;
 					char *pname = p->id;
 
-					if (expr->args->data.str.len) {
-						pname = expr->args->data.str.str;
+					if (arg->data.str.len) {
+						pname = arg->data.str.str;
 						prx = findproxy(pname, PR_CAP_BE);
 					}
 
@@ -2164,17 +2182,17 @@ acl_find_targets(struct proxy *p)
 						continue;
 					}
 
-					free(expr->args->data.str.str);
-					expr->args->data.str.str = NULL;
+					free(arg->data.str.str);
+					arg->data.str.str = NULL;
 					arg->unresolved = 0;
-					expr->args->data.prx = prx;
+					arg->data.prx = prx;
 				}
 				else if (arg->type == ARGT_TAB) {
 					struct proxy *prx = p;
 					char *pname = p->id;
 
-					if (expr->args->data.str.len) {
-						pname = expr->args->data.str.str;
+					if (arg->data.str.len) {
+						pname = arg->data.str.str;
 						prx = find_stktable(pname);
 					}
 
@@ -2193,13 +2211,13 @@ acl_find_targets(struct proxy *p)
 						continue;
 					}
 
-					free(expr->args->data.str.str);
-					expr->args->data.str.str = NULL;
+					free(arg->data.str.str);
+					arg->data.str.str = NULL;
 					arg->unresolved = 0;
-					expr->args->data.prx = prx;
+					arg->data.prx = prx;
 				}
 				else if (arg->type == ARGT_USR) {
-					if (!expr->args->data.str.len) {
+					if (!arg->data.str.len) {
 						Alert("proxy %s: acl '%s' %s(): missing userlist name.\n",
 						      p->id, acl->name, expr->kw->kw);
 						cfgerr++;
@@ -2207,22 +2225,22 @@ acl_find_targets(struct proxy *p)
 					}
 
 					if (p->uri_auth && p->uri_auth->userlist &&
-					    !strcmp(p->uri_auth->userlist->name, expr->args->data.str.str))
+					    !strcmp(p->uri_auth->userlist->name, arg->data.str.str))
 						ul = p->uri_auth->userlist;
 					else
-						ul = auth_find_userlist(expr->args->data.str.str);
+						ul = auth_find_userlist(arg->data.str.str);
 
 					if (!ul) {
 						Alert("proxy %s: acl '%s' %s(%s): unable to find userlist.\n",
-						      p->id, acl->name, expr->kw->kw, expr->args->data.str.str);
+						      p->id, acl->name, expr->kw->kw, arg->data.str.str);
 						cfgerr++;
 						continue;
 					}
 
-					free(expr->args->data.str.str);
-					expr->args->data.str.str = NULL;
+					free(arg->data.str.str);
+					arg->data.str.str = NULL;
 					arg->unresolved = 0;
-					expr->args->data.usr = ul;
+					arg->data.usr = ul;
 				}
 			} /* end of args processing */
 
@@ -2243,6 +2261,7 @@ acl_find_targets(struct proxy *p)
 				}
 
 				list_for_each_entry(pattern, &expr->patterns, list) {
+					/* this keyword only has one argument */
 					pattern->val.group_mask = auth_resolve_groups(expr->args->data.usr, pattern->ptr.str);
 
 					free(pattern->ptr.str);

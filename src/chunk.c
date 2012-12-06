@@ -19,11 +19,36 @@
 #include <common/chunk.h>
 
 /*
+ * Does an snprintf() at the beginning of chunk <chk>, respecting the limit of
+ * at most chk->size chars. If the chk->len is over, nothing is added. Returns
+ * the new chunk size, or < 0 in case of failure.
+ */
+int chunk_printf(struct chunk *chk, const char *fmt, ...)
+{
+	va_list argp;
+	int ret;
+
+	if (!chk->str || !chk->size)
+		return 0;
+
+	va_start(argp, fmt);
+	ret = vsnprintf(chk->str, chk->size, fmt, argp);
+	va_end(argp);
+	chk->len = ret;
+
+	if (ret >= chk->size)
+		ret = -1;
+
+	chk->len = ret;
+	return chk->len;
+}
+
+/*
  * Does an snprintf() at the end of chunk <chk>, respecting the limit of
  * at most chk->size chars. If the chk->len is over, nothing is added. Returns
  * the new chunk size.
  */
-int chunk_printf(struct chunk *chk, const char *fmt, ...)
+int chunk_appendf(struct chunk *chk, const char *fmt, ...)
 {
 	va_list argp;
 	int ret;
@@ -124,6 +149,55 @@ int chunk_asciiencode(struct chunk *dst, struct chunk *src, char qc)
 	return dst->len;
 }
 
+/* Compares the string in chunk <chk> with the string in <str> which must be
+ * zero-terminated. Return is the same as with strcmp(). Neither is allowed
+ * to be null.
+ */
+int chunk_strcmp(const struct chunk *chk, const char *str)
+{
+	const char *s1 = chk->str;
+	int len = chk->len;
+	int diff = 0;
+
+	do {
+		if (--len < 0)
+			break;
+		diff = (unsigned char)*(s1++) - (unsigned char)*(str++);
+	} while (!diff);
+	return diff;
+}
+
+/* Case-insensitively compares the string in chunk <chk> with the string in
+ * <str> which must be zero-terminated. Return is the same as with strcmp().
+ * Neither is allowed to be null.
+ */
+int chunk_strcasecmp(const struct chunk *chk, const char *str)
+{
+	const char *s1 = chk->str;
+	int len = chk->len;
+	int diff = 0;
+
+	do {
+		if (--len < 0)
+			break;
+		diff = (unsigned char)*s1 - (unsigned char)*str;
+		if (unlikely(diff)) {
+			unsigned int l = (unsigned char)*s1;
+			unsigned int r = (unsigned char)*str;
+
+			l -= 'a';
+			r -= 'a';
+
+			if (likely(l <= (unsigned char)'z' - 'a'))
+				l -= 'a' - 'A';
+			if (likely(r <= (unsigned char)'z' - 'a'))
+				r -= 'a' - 'A';
+			diff = l - r;
+		}
+		s1++; str++;
+	} while (!diff);
+	return diff;
+}
 
 /*
  * Local variables:

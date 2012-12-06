@@ -2,7 +2,7 @@
  * include/types/global.h
  * Global variables.
  *
- * Copyright (C) 2000-2010 Willy Tarreau - w@1wt.eu
+ * Copyright (C) 2000-2012 Willy Tarreau - w@1wt.eu
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -26,10 +26,13 @@
 
 #include <common/config.h>
 #include <types/freq_ctr.h>
-#include <types/log.h>
-#include <types/protocols.h>
+#include <types/listener.h>
 #include <types/proxy.h>
 #include <types/task.h>
+
+#ifndef UNIX_MAX_PATH
+#define UNIX_MAX_PATH 108
+#endif
 
 /* modes of operation (global.mode) */
 #define	MODE_DEBUG	0x01
@@ -51,9 +54,8 @@
 #define GTUNE_USE_POLL           (1<<1)
 #define GTUNE_USE_EPOLL          (1<<2)
 #define GTUNE_USE_KQUEUE         (1<<3)
-#define GTUNE_USE_SEPOLL         (1<<4)
 /* platform-specific options */
-#define GTUNE_USE_SPLICE         (1<<5)
+#define GTUNE_USE_SPLICE         (1<<4)
 
 /* Access level for a stats socket */
 #define ACCESS_LVL_NONE     0
@@ -63,19 +65,29 @@
 
 /* FIXME : this will have to be redefined correctly */
 struct global {
+#ifdef USE_OPENSSL
+	char *crt_base;             /* base directory path for certificates */
+	char *ca_base;              /* base directory path for CAs and CRLs */
+#endif
 	int uid;
 	int gid;
 	int nbproc;
 	int maxconn, hardmaxconn;
 #ifdef USE_OPENSSL
 	int maxsslconn;
+	char *listen_default_ciphers;
+	char *connect_default_ciphers;
 #endif
 	struct freq_ctr conn_per_sec;
+	struct freq_ctr comp_bps_in;	/* bytes per second, before http compression */
+	struct freq_ctr comp_bps_out;	/* bytes per second, after http compression */
 	int cps_lim, cps_max;
+	int comp_rate_lim;           /* HTTP compression rate limit */
 	int maxpipes;		/* max # of pipes */
 	int maxsock;		/* max # of sockets */
 	int rlimit_nofile;	/* default ulimit-n value : 0=unset */
 	int rlimit_memmax;	/* default ulimit-d in megs value : 0=unset */
+	long maxzlibmem;        /* max RAM for zlib in bytes */
 	int mode;
 	unsigned int req_count; /* HTTP request counter */
 	int last_checks;
@@ -100,9 +112,16 @@ struct global {
 		int chksize;       /* check buffer size in bytes, defaults to BUFSIZE */
 		int pipesize;      /* pipe size in bytes, system defaults if zero */
 		int max_http_hdr;  /* max number of HTTP headers, use MAX_HTTP_HDR if zero */
+		int cookie_len;    /* max length of cookie captures */
 #ifdef USE_OPENSSL
 		int sslcachesize;  /* SSL cache size in session, defaults to 20000 */
+		unsigned int ssllifetime;   /* SSL session lifetime in seconds */
 #endif
+#ifdef USE_ZLIB
+		int zlibmemlevel;    /* zlib memlevel */
+		int zlibwindowsize;  /* zlib window size */
+#endif
+		int comp_maxlevel;    /* max HTTP compression level */
 	} tune;
 	struct {
 		char *prefix;           /* path prefix of unix bind socket */
@@ -113,7 +132,9 @@ struct global {
 			int level;      /* access level (ACCESS_LVL_*) */
 		} ux;
 	} unix_bind;
-	struct listener stats_sock; /* unix socket listener for statistics */
+#ifdef USE_CPU_AFFINITY
+	unsigned long cpu_map[32];  /* list of CPU masks for the 32 first processes */
+#endif
 	struct proxy *stats_fe;     /* the frontend holding the stats settings */
 };
 
@@ -123,8 +144,7 @@ extern int  relative_pid;       /* process id starting at 1 */
 extern int  actconn;            /* # of active sessions */
 extern int  listeners;
 extern int  jobs;               /* # of active jobs */
-extern char *trash;
-extern int  trashlen;
+extern struct chunk trash;
 extern char *swap_buffer;
 extern int nb_oldpids;          /* contains the number of old pids found */
 extern const int zero;

@@ -1,5 +1,5 @@
 /*
- * Functions used to send/receive data using SOCK_STREAM sockets.
+ * RAW transport layer over SOCK_STREAM sockets.
  *
  * Copyright 2000-2012 Willy Tarreau <w@1wt.eu>
  *
@@ -35,7 +35,6 @@
 #include <proto/freq_ctr.h>
 #include <proto/log.h>
 #include <proto/pipe.h>
-#include <proto/protocols.h>
 #include <proto/raw_sock.h>
 #include <proto/stream_interface.h>
 #include <proto/task.h>
@@ -71,8 +70,17 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 	 * Since older splice() implementations were buggy and returned
 	 * EAGAIN on end of read, let's bypass the call to splice() now.
 	 */
-	if ((fdtab[conn->t.sock.fd].ev & (FD_POLL_IN|FD_POLL_HUP)) == FD_POLL_HUP)
-		goto out_read0;
+	if (unlikely(!(fdtab[conn->t.sock.fd].ev & FD_POLL_IN))) {
+		/* stop here if we reached the end of data */
+		if ((fdtab[conn->t.sock.fd].ev & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP)
+			goto out_read0;
+
+		/* report error on POLL_ERR before connection establishment */
+		if ((fdtab[conn->t.sock.fd].ev & FD_POLL_ERR) && (conn->flags & CO_FL_WAIT_L4_CONN)) {
+			conn->flags |= CO_FL_ERROR;
+			return retval;
+		}
+	}
 
 	while (count) {
 		if (count > MAX_SPLICE_AT_ONCE)
@@ -121,7 +129,7 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 					__conn_data_poll_recv(conn); /* we know for sure that it's EAGAIN */
 				break;
 			}
-			else if (errno == ENOSYS || errno == EINVAL) {
+			else if (errno == ENOSYS || errno == EINVAL || errno == EBADF) {
 				/* splice not supported on this end, disable it.
 				 * We can safely return -1 since there is no
 				 * chance that any data has been piped yet.
@@ -148,10 +156,13 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 		}
 	} /* while */
 
+	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && retval)
+		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	return retval;
 
  out_read0:
 	conn_sock_read0(conn);
+	conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	return retval;
 }
 
@@ -182,6 +193,8 @@ int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
 		done += ret;
 		pipe->data -= ret;
 	}
+	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && done)
+		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	return done;
 }
 
@@ -202,9 +215,17 @@ static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 	int ret, done = 0;
 	int try = count;
 
-	/* stop here if we reached the end of data */
-	if ((fdtab[conn->t.sock.fd].ev & (FD_POLL_IN|FD_POLL_HUP)) == FD_POLL_HUP)
-		goto read0;
+	if (unlikely(!(fdtab[conn->t.sock.fd].ev & FD_POLL_IN))) {
+		/* stop here if we reached the end of data */
+		if ((fdtab[conn->t.sock.fd].ev & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP)
+			goto read0;
+
+		/* report error on POLL_ERR before connection establishment */
+		if ((fdtab[conn->t.sock.fd].ev & FD_POLL_ERR) && (conn->flags & CO_FL_WAIT_L4_CONN)) {
+			conn->flags |= CO_FL_ERROR;
+			return done;
+		}
+	}
 
 	/* compute the maximum block size we can read at once. */
 	if (buffer_empty(buf)) {
@@ -253,10 +274,14 @@ static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 			break;
 		}
 	}
+
+	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && done)
+		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	return done;
 
  read0:
 	conn_sock_read0(conn);
+	conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	return done;
 }
 
@@ -304,7 +329,7 @@ static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 			if (ret < try)
 				break;
 		}
-		else if (ret == 0 || errno == EAGAIN) {
+		else if (ret == 0 || errno == EAGAIN || errno == ENOTCONN) {
 			/* nothing written, we need to poll for write first */
 			__conn_data_poll_send(conn);
 			break;
@@ -314,12 +339,14 @@ static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 			break;
 		}
 	}
+	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && done)
+		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	return done;
 }
 
 
-/* data-layer operations for RAW sockets */
-struct data_ops raw_sock = {
+/* transport-layer operations for RAW sockets */
+struct xprt_ops raw_sock = {
 	.snd_buf  = raw_sock_from_buf,
 	.rcv_buf  = raw_sock_to_buf,
 #if defined(CONFIG_HAP_LINUX_SPLICE)

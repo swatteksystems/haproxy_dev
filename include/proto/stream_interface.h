@@ -36,76 +36,53 @@ int stream_int_check_timeouts(struct stream_interface *si);
 void stream_int_report_error(struct stream_interface *si);
 void stream_int_retnclose(struct stream_interface *si, const struct chunk *msg);
 int conn_si_send_proxy(struct connection *conn, unsigned int flag);
-void conn_notify_si(struct connection *conn);
 int stream_int_shutr(struct stream_interface *si);
 int stream_int_shutw(struct stream_interface *si);
-void si_conn_recv_cb(struct connection *conn);
-void si_conn_send_cb(struct connection *conn);
 void stream_sock_read0(struct stream_interface *si);
 
 extern struct si_ops si_embedded_ops;
-extern struct si_ops si_task_ops;
 extern struct si_ops si_conn_ops;
-extern struct app_cb si_conn_cb;
+extern struct data_cb si_conn_cb;
 
 struct task *stream_int_register_handler(struct stream_interface *si,
 					 struct si_applet *app);
-struct task *stream_int_register_handler_task(struct stream_interface *si,
-					      struct task *(*fct)(struct task *));
 void stream_int_unregister_handler(struct stream_interface *si);
 
 static inline const struct protocol *si_ctrl(struct stream_interface *si)
 {
-	return si->conn.ctrl;
+	return si->conn->ctrl;
 }
 
-static inline int si_fd(struct stream_interface *si)
-{
-	return si->conn.t.sock.fd;
-}
-
-static inline void si_prepare_conn(struct stream_interface *si, const struct protocol *ctrl, const struct data_ops *ops)
+static inline void si_prepare_conn(struct stream_interface *si, const struct protocol *ctrl, const struct xprt_ops *xprt)
 {
 	si->ops = &si_conn_ops;
-	si->conn.app_cb = &si_conn_cb;
-	si->conn.ctrl = ctrl;
-	si->conn.data = ops;
-	si->conn.data_st = 0;
-	si->conn.data_ctx = NULL;
+	conn_prepare(si->conn, &si_conn_cb, ctrl, xprt, si);
+}
+
+static inline void si_takeover_conn(struct stream_interface *si, const struct protocol *ctrl, const struct xprt_ops *xprt)
+{
+	si->ops = &si_conn_ops;
+	conn_assign(si->conn, &si_conn_cb, ctrl, xprt, si);
 }
 
 static inline void si_prepare_embedded(struct stream_interface *si)
 {
 	si->ops = &si_embedded_ops;
-	si->conn.app_cb = NULL;
-	si->conn.ctrl = NULL;
-	si->conn.data = NULL;
-	si->conn.data_st = 0;
-	si->conn.data_ctx = NULL;
-}
-
-static inline void si_prepare_task(struct stream_interface *si)
-{
-	si->ops = &si_task_ops;
-	si->conn.app_cb = NULL;
-	si->conn.ctrl = NULL;
-	si->conn.data = NULL;
-	si->conn.data_st = 0;
-	si->conn.data_ctx = NULL;
+	conn_prepare(si->conn, NULL, NULL, NULL, si);
 }
 
 /* Sends a shutr to the connection using the data layer */
 static inline void si_shutr(struct stream_interface *si)
 {
 	if (stream_int_shutr(si))
-		conn_data_stop_recv(&si->conn);
+		conn_data_stop_recv(si->conn);
 }
 
 /* Sends a shutw to the connection using the data layer */
 static inline void si_shutw(struct stream_interface *si)
 {
 	if (stream_int_shutw(si))
-		conn_data_stop_send(&si->conn);
+		conn_data_stop_send(si->conn);
 }
 
 /* Calls the data state update on the stream interfaace */
@@ -134,20 +111,20 @@ static inline int si_connect(struct stream_interface *si)
 	if (unlikely(!si_ctrl(si) || !si_ctrl(si)->connect))
 		return SN_ERR_INTERNAL;
 
-	ret = si_ctrl(si)->connect(&si->conn, !channel_is_empty(si->ob));
+	ret = si_ctrl(si)->connect(si->conn, !channel_is_empty(si->ob), !!si->send_proxy_ofs);
 	if (ret != SN_ERR_NONE)
 		return ret;
 
 	/* needs src ip/port for logging */
 	if (si->flags & SI_FL_SRC_ADDR)
-		conn_get_from_addr(&si->conn);
+		conn_get_from_addr(si->conn);
 
 	/* Prepare to send a few handshakes related to the on-wire protocol. */
 	if (si->send_proxy_ofs)
-		si->conn.flags |= CO_FL_SI_SEND_PROXY;
+		si->conn->flags |= CO_FL_SI_SEND_PROXY;
 
 	/* we need to be notified about connection establishment */
-	si->conn.flags |= CO_FL_NOTIFY_SI;
+	si->conn->flags |= CO_FL_WAKE_DATA;
 
 	/* we're in the process of establishing a connection */
 	si->state = SI_ST_CON;
