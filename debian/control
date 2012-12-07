@@ -1,12 +1,14 @@
 Source: haproxy
 Section: net
 Priority: optional
-Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+Maintainer: Marcelo Martins <btorch@gmail.com>
 XSBC-Original-Maintainer: Christo Buschek <crito@30loops.net>
 Uploaders: Arnaud Cornet <acornet@debian.org>
 Standards-Version: 3.9.1
 Build-Depends: debhelper (>= 7.0.50~), libpcre3-dev, quilt (>= 0.46-7~)
 Homepage: http://haproxy.1wt.eu/
+Vcs-Git: git://github.com/btorch/haproxy_dev.git
+Vcs-Browser: https://github.com/btorch/haproxy_dev
 
 Package: haproxy
 Architecture: any
