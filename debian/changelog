@@ -1,7 +1,8 @@
-haproxy (1.5.0) precise; urgency=low
+haproxy (1.5.14) precise; urgency=low
 
   * Please check on the source CHANGELOG file for more information
   * This packages was built using the development 1.5-dev14 release
+  * The change on this file was for testing jenkins deployment 
 
  -- Marcelo Martins <btorch@gmail.com>  Thu, 06 Dec 2012 18:40:29 +0000
 
