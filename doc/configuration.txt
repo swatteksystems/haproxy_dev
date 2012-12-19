@@ -4,7 +4,7 @@
                          ----------------------
                              version 1.5
                              willy tarreau
-                              2012/11/26
+                              2012/12/12
 
 
 This document covers the configuration language as implemented in the version
@@ -79,6 +79,7 @@ Summary
 8.2.2.        TCP log format
 8.2.3.        HTTP log format
 8.2.4.        Custom log format
+8.2.5.        Error log format
 8.3.      Advanced logging options
 8.3.1.        Disabling logging of external tests
 8.3.2.        Logging before waiting for the session to terminate
@@ -877,14 +878,16 @@ tune.sndbuf.server <number>
   notifying haproxy again.
 
 tune.ssl.cachesize <number>
-  Sets the size of the global SSL session cache, in number of sessions. Each
-  entry uses approximately 600 bytes of memory. The default value may be forced
-  at build time, otherwise defaults to 20000. When the cache is full, the most
-  idle entries are purged and reassigned. Higher values reduce the occurrence
-  of such a purge, hence the number of CPU-intensive SSL handshakes by ensuring
-  that all users keep their session as long as possible. All entries are pre-
-  allocated upon startup and are shared between all processes if "nbproc" is
-  greater than 1.
+  Sets the size of the global SSL session cache, in a number of blocks. A block
+  is large enough to contain an encoded session without peer certificate.
+  An encoded session with peer certificate is stored in multiple blocks
+  depending on the size of the peer certificate. A block use approximatively
+  200 bytes of memory. The default value may be forced at build time, otherwise
+  defaults to 20000.  When the cache is full, the most idle entries are purged
+  and reassigned. Higher values reduce the occurrence of such a purge, hence
+  the number of CPU-intensive SSL handshakes by ensuring that all users keep
+  their session as long as possible. All entries are pre-allocated upon startup
+  and are shared between all processes if "nbproc" is greater than 1.
 
 tune.ssl.lifetime <timeout>
   Sets how long a cached SSL session may remain valid. This time is expressed
@@ -1903,20 +1906,29 @@ compression offload
 
   Compression will be activated depending on the Accept-Encoding request
   header. With identity, it does not take care of that header.
+  If backend servers support HTTP compression, these directives
+  will be no-op: haproxy will see the compressed response and will not
+  compress again. If backend servers do not support HTTP compression and
+  there is Accept-Encoding header in request, haproxy will compress the
+  matching response.
 
   The "offload" setting makes haproxy remove the Accept-Encoding header to
   prevent backend servers from compressing responses. It is strongly
   recommended not to do this because this means that all the compression work
   will be done on the single point where haproxy is located. However in some
   deployment scenarios, haproxy may be installed in front of a buggy gateway
-  and need to prevent it from emitting invalid payloads. In this case, simply
-  removing the header in the configuration does not work because it applies
-  before the header is parsed, so that prevents haproxy from compressing. The
-  "offload" setting should then be used for such scenarios.
+  with broken HTTP compression implementation which can't be turned off.
+  In that case haproxy can be used to prevent that gateway from emitting
+  invalid payloads. In this case, simply removing the header in the
+  configuration does not work because it applies before the header is parsed,
+  so that prevents haproxy from compressing. The "offload" setting should
+  then be used for such scenarios.
 
   Compression is disabled when:
     * the server is not HTTP/1.1.
+    * HTTP status code is not 200
     * requests does not contain Transfer-Encoding: chunked or Content-Length.
+    * Content-Type is multipart
     * the request contains "Cache-control: no-transform".
     * User-Agent matches "Mozilla/4" except MSIE 6 with XP SP2, or MSIE 7 and later.
     * The response is already compressed (see compression offload).
@@ -6137,9 +6149,12 @@ tcp-request connection <action> [{if | unless} <condition>]
         the per-frontend counters and the second set for the per-backend ones.
 
         These actions take one or two arguments :
-          <key>   is mandatory, and defines the criterion the tracking key will
-                  be derived from. At the moment, only "src" is supported. With
-                  it, the key will be the connection's source IPv4 address.
+          <key>   is mandatory, and is a pattern extraction rule as described
+                  in section 7.8. It describes what elements of the incoming
+                  request or connection will be analysed, extracted, combined,
+                  and used to select which table entry to update the counters.
+                  Note that "tcp-request connection" cannot use content-based
+                  fetches.
 
          <table>  is an optional table to be used instead of the default one,
                   which is the stick-table declared in the current proxy. All
@@ -6151,6 +6166,11 @@ tcp-request connection <action> [{if | unless} <condition>]
         that entry is kept during all the session's life, and this entry's
         counters are updated as often as possible, every time the session's
         counters are updated, and also systematically when the session ends.
+        Counters are only updated for events that happen after the tracking has
+        been started. For example, connection counters will not be updated when
+        tracking layer 7 information, since the connection event happens before
+        layer7 information is extracted.
+
         If the entry tracks concurrent connection counters, one connection is
         counted for as long as the entry is tracked, and the entry will not
         expire during that time. Tracking counters also provides a performance
@@ -6225,9 +6245,12 @@ tcp-request content <action> [{if | unless} <condition>]
   Also, it is worth noting that if sticky counters are tracked from a rule
   defined in a backend, this tracking will automatically end when the session
   releases the backend. That allows per-backend counter tracking even in case
-  of HTTP keep-alive requests when the backend changes. While there is nothing
-  mandatory about it, it is recommended to use the track-sc1 pointer to track
-  per-frontend counters and track-sc2 to track per-backend counters.
+  of HTTP keep-alive requests when the backend changes. This makes a subtle
+  difference because tracking rules in "frontend" and "listen" section last for
+  all the session, as opposed to the backend rules. The difference appears when
+  some layer 7 information is tracked. While there is nothing mandatory about
+  it, it is recommended to use the track-sc1 pointer to track per-frontend
+  counters and track-sc2 to track per-backend counters.
 
   Note that the "if/unless" condition is optional. If no condition is set on
   the action, it is simply performed unconditionally. That can be useful for
@@ -6239,6 +6262,11 @@ tcp-request content <action> [{if | unless} <condition>]
   contents do not parse as a valid HTTP message, then the ACL does not match.
   The parser which is involved there is exactly the same as for all other HTTP
   processing, so there is no risk of parsing something differently.
+
+  Tracking layer7 information is also possible provided that the information
+  are present when the rule is processed. The current solution for making the
+  rule engine wait for such information is to set an inspect delay and to
+  condition its execution with an ACL relying on such information.
 
   Example:
         # Accept HTTP requests containing a Host header saying "example.com"
@@ -6259,6 +6287,16 @@ tcp-request content <action> [{if | unless} <condition>]
         acl content_present req_len gt 0
         tcp-request content accept if content_present
         tcp-request content reject
+
+  Example:
+        # Track the last IP from X-Forwarded-For
+        tcp-request inspect-delay 10s
+        tcp-request content track-sc1 hdr(x-forwarded-for,-1) if HTTP
+
+  Example:
+        # track request counts per "base" (concatenation of Host+URL)
+        tcp-request inspect-delay 10s
+        tcp-request content track-sc1 base table req-rate if HTTP
 
   Example: track per-frontend and per-backend counters, block abusers at the
            frontend when the backend detects abuse.
@@ -8009,6 +8047,20 @@ be_sess_rate(<backend>) <integer>
             acl being_scanned be_sess_rate gt 100
             redirect location /denied.html if being_scanned
 
+srv_sess_rate(<backend>/<server>) <integer>
+  Returns true when the sessions creation rate on the server matches the
+  specified values or ranges, in number of new sessions per second. This is
+  used to switch to an alternate backend when an expensive or fragile one
+  reaches too high a session rate, or to limit abuse of service (eg. prevent
+  latent requests from overloading servers).
+
+  Example :
+        # Redirect to a separate back
+        acl srv1_full srv_sess_rate(be1/srv1) gt 50
+        acl srv2_full srv_sess_rate(be1/srv2) gt 50
+        use_backend be2 if srv1_full or srv2_full
+
+
 connslots <integer>
 connslots(<backend>) <integer>
   The basic idea here is to be able to measure the number of connection "slots"
@@ -8223,6 +8275,15 @@ sc2_sess_rate
   rules. A backend may count more sessions than connections because each
   connection could result in many backend sessions if some HTTP keep-alive is
   performed over the connection with the client. See also src_sess_rate.
+
+sc1_trackers
+sc2_trackers
+  Returns the current amount of concurrent connections tracking the same
+  tracked counters. This number is automatically incremented when tracking
+  begins and decremented when tracking stops. It differs from sc1_conn_cur in
+  that it does not rely on any stored information but on the table's reference
+  count (the "use" value which is returned by "show table" on the CLI). This
+  may sometimes be more suited for layer7 tracking.
 
 so_id <integer>
   Applies to the socket's id. Useful in frontends with many bind keywords.
@@ -9255,6 +9316,17 @@ The list of currently supported pattern fetch functions is the following :
                table also allows one to collect statistics about most commonly
                requested objects by host/path.
 
+  base32       This returns a 32-bit hash of the value returned by the "base"
+               fetch method above. This is useful to track per-URL activity on
+               high traffic sites without having to store all URLs. Instead a
+               shorter hash is stored, saving a lot of memory. The output type
+               is an unsigned integer.
+
+  base32+src   This returns the concatenation of the base32 fetch above and the
+               src fetch below. The resulting type is of type binary, with a
+               size of 8 or 20 bytes depending on the source address family.
+               This can be used to track per-IP, per-URL counters.
+
   src          This is the source IPv4 address of the client of the session.
                It is of type IPv4 and works on both IPv4 and IPv6 tables.
                On IPv6 tables, IPv4 address is mapped to its IPv6 equivalent,
@@ -10230,6 +10302,34 @@ Please refer to the table below for currently defined variables :
   +---+------+-----------------------------------------------+-------------+
 
     R = Restrictions : H = mode http only ; S = SSL only
+
+
+8.2.5. Error log format
+-----------------------
+
+When an incoming connection fails due to an SSL handshake or an invalid PROXY
+protocol header, haproxy will log the event using a shorter, fixed line format.
+By default, logs are emitted at the LOG_INFO level, unless the option
+"log-separate-errors" is set in the backend, in which case the LOG_ERR level
+will be used. Connections on which no data are exchanged (eg: probes) are not
+logged if the "dontlognull" option is set.
+
+The format looks like this :
+
+    >>> Dec  3 18:27:14 localhost \
+          haproxy[6103]: 127.0.0.1:56059 [03/Dec/2012:17:35:10.380] frt/f1: \
+          Connection error during SSL handshake
+
+  Field   Format                                Extract from the example above
+      1   process_name '[' pid ']:'                             haproxy[6103]:
+      2   client_ip ':' client_port                            127.0.0.1:56059
+      3   '[' accept_date ']'                       [03/Dec/2012:17:35:10.380]
+      4   frontend_name "/" bind_name ":"                              frt/f1:
+      5   message                        Connection error during SSL handshake
+
+These fields just provide minimal information to help debugging connection
+failures.
+
 
 8.3. Advanced logging options
 -----------------------------

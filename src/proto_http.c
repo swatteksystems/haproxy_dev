@@ -2060,38 +2060,48 @@ int select_compression_response_header(struct session *s, struct buffer *res)
 	if (!(msg->flags & HTTP_MSGF_VER_11))
 		goto fail;
 
-	ctx.idx = 0;
+	/* 200 only */
+	if (txn->status != 200)
+		goto fail;
 
 	/* Content-Length is null */
 	if (!(msg->flags & HTTP_MSGF_TE_CHNK) && msg->body_len == 0)
 		goto fail;
 
 	/* content is already compressed */
+	ctx.idx = 0;
 	if (http_find_header2("Content-Encoding", 16, res->p, &txn->hdr_idx, &ctx))
 		goto fail;
 
 	comp_type = NULL;
 
-	/* if there was a compression content-type option in the backend or the frontend
-	 * The backend have priority.
+	/* we don't want to compress multipart content-types, nor content-types that are
+	 * not listed in the "compression type" directive if any. If no content-type was
+	 * found but configuration requires one, we don't compress either. Backend has
+	 * the priority.
 	 */
-	if ((s->be->comp && (comp_type = s->be->comp->types)) || (s->fe->comp && (comp_type = s->fe->comp->types))) {
-		if (http_find_header2("Content-Type", 12, res->p, &txn->hdr_idx, &ctx)) {
+	ctx.idx = 0;
+	if (http_find_header2("Content-Type", 12, res->p, &txn->hdr_idx, &ctx)) {
+		if (ctx.vlen >= 9 && strncasecmp("multipart", ctx.line+ctx.val, 9) == 0)
+			goto fail;
+
+		if ((s->be->comp && (comp_type = s->be->comp->types)) ||
+		    (s->fe->comp && (comp_type = s->fe->comp->types))) {
 			for (; comp_type; comp_type = comp_type->next) {
-				if (strncmp(ctx.line+ctx.val, comp_type->name, comp_type->name_len) == 0)
+				if (ctx.vlen >= comp_type->name_len &&
+				    strncasecmp(ctx.line+ctx.val, comp_type->name, comp_type->name_len) == 0)
 					/* this Content-Type should be compressed */
 					break;
 			}
-		} else {
-			/* there is no Content-Type header */
-			goto fail;
+			/* this Content-Type should not be compressed */
+			if (comp_type == NULL)
+				goto fail;
 		}
-		/* this Content-Type should not be compressed */
-		if (comp_type == NULL)
-			goto fail;
 	}
-
-	ctx.idx = 0;
+	else { /* no content-type header */
+		if ((s->be->comp && s->be->comp->types) || (s->fe->comp && s->fe->comp->types))
+			goto fail; /* a content-type was required */
+	}
 
 	/* limit compression rate */
 	if (global.comp_rate_lim > 0)
@@ -2109,6 +2119,7 @@ int select_compression_response_header(struct session *s, struct buffer *res)
 	s->flags |= SN_COMP_READY;
 
 	/* remove Content-Length header */
+	ctx.idx = 0;
 	if ((msg->flags & HTTP_MSGF_CNT_LEN) && http_find_header2("Content-Length", 14, res->p, &txn->hdr_idx, &ctx))
 		http_remove_header2(msg, &txn->hdr_idx, &ctx);
 
@@ -2323,6 +2334,8 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 				session_inc_http_err_ctr(s);
 			}
 
+			txn->status = 400;
+			stream_int_retnclose(req->prod, NULL);
 			msg->msg_state = HTTP_MSG_ERROR;
 			req->analysers = 0;
 
@@ -2999,6 +3012,9 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 			goto return_prx_cond;
 		}
 	}
+
+	/* just in case we have some per-backend tracking */
+	session_inc_be_http_req_ctr(s);
 
 	/* evaluate http-request rules */
 	http_req_last_rule = http_check_access_rule(px, &px->http_req_rules, s, txn);
@@ -4029,14 +4045,14 @@ void http_end_txn_clean_session(struct session *s)
 
 		if (s->fe->mode == PR_MODE_HTTP) {
 			s->fe->fe_counters.p.http.rsp[n]++;
-			if (s->comp_algo)
+			if (s->comp_algo && (s->flags & SN_COMP_READY))
 				s->fe->fe_counters.p.http.comp_rsp++;
 		}
 		if ((s->flags & SN_BE_ASSIGNED) &&
 		    (s->be->mode == PR_MODE_HTTP)) {
 			s->be->be_counters.p.http.rsp[n]++;
 			s->be->be_counters.p.http.cum_req++;
-			if (s->comp_algo)
+			if (s->comp_algo && (s->flags & SN_COMP_READY))
 				s->be->be_counters.p.http.comp_rsp++;
 		}
 	}
@@ -4082,6 +4098,7 @@ void http_end_txn_clean_session(struct session *s)
 	s->req->cons->state     = s->req->cons->prev_state = SI_ST_INI;
 	s->req->cons->conn->t.sock.fd = -1; /* just to help with debugging */
 	s->req->cons->conn->flags = CO_FL_NONE;
+	s->req->cons->conn->err_code = CO_ER_NONE;
 	s->req->cons->err_type  = SI_ET_NONE;
 	s->req->cons->conn_retries = 0;  /* used for logging too */
 	s->req->cons->err_loc   = NULL;
@@ -4918,6 +4935,29 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 			return 0;
 		}
 
+		/* client abort with an abortonclose */
+		else if ((rep->flags & CF_SHUTR) && ((s->req->flags & (CF_SHUTR|CF_SHUTW)) == (CF_SHUTR|CF_SHUTW))) {
+			s->fe->fe_counters.cli_aborts++;
+			s->be->be_counters.cli_aborts++;
+			if (objt_server(s->target))
+				objt_server(s->target)->counters.cli_aborts++;
+
+			rep->analysers = 0;
+			channel_auto_close(rep);
+
+			txn->status = 400;
+			bi_erase(rep);
+			stream_int_retnclose(rep->cons, http_error_message(s, HTTP_ERR_400));
+
+			if (!(s->flags & SN_ERR_MASK))
+				s->flags |= SN_ERR_CLICL;
+			if (!(s->flags & SN_FINST_MASK))
+				s->flags |= SN_FINST_H;
+
+			/* process_session() will take care of the error */
+			return 0;
+		}
+
 		/* close from server, capture the response if the server has started to respond */
 		else if (rep->flags & CF_SHUTR) {
 			if (msg->msg_state >= HTTP_MSG_RPVER || msg->err_pos >= 0)
@@ -5102,6 +5142,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	    (txn->status >= 100 && txn->status < 200) ||
 	    txn->status == 204 || txn->status == 304) {
 		msg->flags |= HTTP_MSGF_XFER_LEN;
+		s->comp_algo = NULL;
 		goto skip_content_length;
 	}
 
@@ -5738,8 +5779,18 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 		http_compression_buffer_end(s, &res->buf, &tmpbuf, 0);
 		compressing = 0;
 	}
-	/* stop waiting for data if the input is closed before the end */
+
+	if (res->flags & CF_SHUTW)
+		goto aborted_xfer;
+
+	/* stop waiting for data if the input is closed before the end. If the
+	 * client side was already closed, it means that the client has aborted,
+	 * so we don't want to count this as a server abort. Otherwise it's a
+	 * server abort.
+	 */
 	if (res->flags & CF_SHUTR) {
+		if ((res->flags & CF_SHUTW_NOW) || (s->req->flags & CF_SHUTR))
+			goto aborted_xfer;
 		if (!(s->flags & SN_ERR_MASK))
 			s->flags |= SN_ERR_SRVCL;
 		s->be->be_counters.srv_aborts++;
@@ -5747,9 +5798,6 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 			objt_server(s->target)->counters.srv_aborts++;
 		goto return_bad_res_stats_ok;
 	}
-
-	if (res->flags & CF_SHUTW)
-		goto aborted_xfer;
 
 	/* we need to obey the req analyser, so if it leaves, we must too */
 	if (!s->req->analysers)
@@ -8441,6 +8489,92 @@ smp_fetch_base(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 	return 1;
 }
 
+/* This produces a 32-bit hash of the concatenation of the first occurrence of
+ * the Host header followed by the path component if it begins with a slash ('/').
+ * This means that '*' will not be added, resulting in exactly the first Host
+ * entry. If no Host header is found, then the path is used. The resulting value
+ * is hashed using the url hash followed by a full avalanche hash and provides a
+ * 32-bit integer value. This fetch is useful for tracking per-URL activity on
+ * high-traffic sites without having to store whole paths.
+ */
+static int
+smp_fetch_base32(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                 const struct arg *args, struct sample *smp)
+{
+	struct http_txn *txn = l7;
+	struct hdr_ctx ctx;
+	unsigned int hash = 0;
+	char *ptr, *beg, *end;
+	int len;
+
+	CHECK_HTTP_MESSAGE_FIRST();
+
+	ctx.idx = 0;
+	if (http_find_header2("Host", 4, txn->req.chn->buf->p + txn->req.sol, &txn->hdr_idx, &ctx)) {
+		/* OK we have the header value in ctx.line+ctx.val for ctx.vlen bytes */
+		ptr = ctx.line + ctx.val;
+		len = ctx.vlen;
+		while (len--)
+			hash = *(ptr++) + (hash << 6) + (hash << 16) - hash;
+	}
+
+	/* now retrieve the path */
+	end = txn->req.chn->buf->p + txn->req.sol + txn->req.sl.rq.u + txn->req.sl.rq.u_l;
+	beg = http_get_path(txn);
+	if (!beg)
+		beg = end;
+
+	for (ptr = beg; ptr < end && *ptr != '?'; ptr++);
+
+	if (beg < ptr && *beg == '/') {
+		while (beg < ptr)
+			hash = *(beg++) + (hash << 6) + (hash << 16) - hash;
+	}
+	hash = full_hash(hash);
+
+	smp->type = SMP_T_UINT;
+	smp->data.uint = hash;
+	smp->flags = SMP_F_VOL_1ST;
+	return 1;
+}
+
+/* This concatenates the source address with the 32-bit hash of the Host and
+ * URL as returned by smp_fetch_base32(). The idea is to have per-source and
+ * per-url counters. The result is a binary block from 8 to 20 bytes depending
+ * on the source address length. The URL hash is stored before the address so
+ * that in environments where IPv6 is insignificant, truncating the output to
+ * 8 bytes would still work.
+ */
+static int
+smp_fetch_base32_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                     const struct arg *args, struct sample *smp)
+{
+	struct chunk *temp = sample_get_trash_chunk();
+
+	if (!smp_fetch_base32(px, l4, l7, opt, args, smp))
+		return 0;
+
+	memcpy(temp->str + temp->len, &smp->data.uint, sizeof(smp->data.uint));
+	temp->len += sizeof(smp->data.uint);
+
+	switch (l4->si[0].conn->addr.from.ss_family) {
+	case AF_INET:
+		memcpy(temp->str + temp->len, &((struct sockaddr_in *)&l4->si[0].conn->addr.from)->sin_addr, 4);
+		temp->len += 4;
+		break;
+	case AF_INET6:
+		memcpy(temp->str + temp->len, &((struct sockaddr_in6 *)(&l4->si[0].conn->addr.from))->sin6_addr, 16);
+		temp->len += 16;
+		break;
+	default:
+		return 0;
+	}
+
+	smp->data.str = *temp;
+	smp->type = SMP_T_BIN;
+	return 1;
+}
+
 static int
 acl_fetch_proto_http(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                      const struct arg *args, struct sample *smp)
@@ -9062,6 +9196,8 @@ static struct acl_kw_list acl_kws = {{ },{
 static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
 	{ "hdr",        smp_fetch_hdr,            ARG2(1,STR,SINT), val_hdr, SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
 	{ "base",       smp_fetch_base,           0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
+	{ "base32",     smp_fetch_base32,         0,                NULL,    SMP_T_UINT, SMP_CAP_L7|SMP_CAP_REQ },
+	{ "base32+src", smp_fetch_base32_src,     0,                NULL,    SMP_T_BIN,  SMP_CAP_L7|SMP_CAP_REQ },
 	{ "path",       smp_fetch_path,           0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
 	{ "url",        smp_fetch_url,            0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
 	{ "url_ip",     smp_fetch_url_ip,         0,                NULL,    SMP_T_IPV4, SMP_CAP_L7|SMP_CAP_REQ },

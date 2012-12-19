@@ -485,7 +485,6 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
  out_error:
 	/* Write error on the file descriptor */
 	conn->flags |= CO_FL_ERROR;
-	conn->flags &= ~flag;
 	return 0;
 
  out_wait:
@@ -800,15 +799,23 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 	     (fdtab[si->conn->t.sock.fd].ev & FD_POLL_OUT)))   /* we'll be called anyway */
 		return;
 
-	if (!(si->conn->flags & CO_FL_HANDSHAKE) && si_conn_send_loop(si->conn) < 0) {
-		/* Write error on the file descriptor. We mark the FD as STERROR so
-		 * that we don't use it anymore and we notify the task.
+	if (!(si->conn->flags & (CO_FL_HANDSHAKE|CO_FL_WAIT_L4_CONN|CO_FL_WAIT_L6_CONN))) {
+		/* Before calling the data-level operations, we have to prepare
+		 * the polling flags to ensure we properly detect changes.
 		 */
-		fdtab[si->conn->t.sock.fd].ev &= ~FD_POLL_STICKY;
-		__conn_data_stop_both(si->conn);
-		si->flags |= SI_FL_ERR;
-		si->conn->flags |= CO_FL_ERROR;
-		goto out_wakeup;
+		if (si->conn->ctrl)
+			fd_want_send(si->conn->t.sock.fd);
+		si->conn->flags &= ~(CO_FL_WAIT_DATA|CO_FL_WAIT_ROOM|CO_FL_WAIT_RD|CO_FL_WAIT_WR);
+		si->conn->flags |= CO_FL_CURR_WR_ENA;
+
+		if (si_conn_send_loop(si->conn) < 0) {
+			/* Write error on the file descriptor */
+			fd_stop_both(si->conn->t.sock.fd);
+			__conn_data_stop_both(si->conn);
+			si->flags |= SI_FL_ERR;
+			si->conn->flags |= CO_FL_ERROR;
+			goto out_wakeup;
+		}
 	}
 
 	/* OK, so now we know that some data might have been sent, and that we may
@@ -820,6 +827,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 		 * ->o limit was reached. Maybe we just wrote the last
 		 * chunk and need to close.
 		 */
+		__conn_data_stop_send(si->conn);
 		if (((ob->flags & (CF_SHUTW|CF_AUTO_CLOSE|CF_SHUTW_NOW)) ==
 		     (CF_AUTO_CLOSE|CF_SHUTW_NOW)) &&
 		    (si->state == SI_ST_EST)) {
@@ -1027,7 +1035,7 @@ static void si_conn_recv_cb(struct connection *conn)
 		}
 
 		if ((chn->flags & CF_READ_DONTWAIT) || --read_poll <= 0) {
-			conn_data_stop_recv(conn);
+			__conn_data_stop_recv(conn);
 			break;
 		}
 

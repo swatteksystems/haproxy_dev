@@ -29,16 +29,13 @@
 
 #include <types/listener.h>
 #include <types/obj_type.h>
+#include <types/port_range.h>
 #include <types/protocol.h>
 
 /* referenced below */
 struct connection;
 struct buffer;
 struct pipe;
-struct server;
-struct proxy;
-struct si_applet;
-struct task;
 
 /* Polling flags that are manipulated by I/O callbacks and handshake callbacks
  * indicate what they expect from a file descriptor at each layer. For each
@@ -142,6 +139,43 @@ enum {
 	CO_FL_XPRT_TRACKED  = 0x80000000,
 };
 
+
+/* possible connection error codes */
+enum {
+	CO_ER_NONE,             /* no error */
+	CO_ER_PRX_EMPTY,        /* nothing received in PROXY protocol header */
+	CO_ER_PRX_ABORT,        /* client abort during PROXY protocol header */
+	CO_ER_PRX_TIMEOUT,      /* timeout while waiting for a PROXY header */
+	CO_ER_PRX_TRUNCATED,    /* truncated PROXY protocol header */
+	CO_ER_PRX_NOT_HDR,      /* not a PROXY protocol header */
+	CO_ER_PRX_BAD_HDR,      /* bad PROXY protocol header */
+	CO_ER_PRX_BAD_PROTO,    /* unsupported protocol in PROXY header */
+
+	CO_ER_SSL_EMPTY,        /* client closed during SSL handshake */
+	CO_ER_SSL_ABORT,        /* client abort during SSL handshake */
+	CO_ER_SSL_TIMEOUT,      /* timeout during SSL handshake */
+	CO_ER_SSL_TOO_MANY,     /* too many SSL connections */
+	CO_ER_SSL_NO_MEM,       /* no more memory to allocate an SSL connection */
+	CO_ER_SSL_RENEG,        /* forbidden client renegociation */
+	CO_ER_SSL_CA_FAIL,      /* client cert verification failed in the CA chain */
+	CO_ER_SSL_CRT_FAIL,     /* client cert verification failed on the certificate */
+	CO_ER_SSL_HANDSHAKE,    /* SSL error during handshake */
+	CO_ER_SSL_NO_TARGET,    /* unkonwn target (not client nor server) */
+};
+
+/* source address settings for outgoing connections */
+enum {
+	/* Tproxy exclusive values from 0 to 7 */
+	CO_SRC_TPROXY_ADDR = 0x0001,    /* bind to this non-local address when connecting */
+	CO_SRC_TPROXY_CIP  = 0x0002,    /* bind to the client's IP address when connecting */
+	CO_SRC_TPROXY_CLI  = 0x0003,    /* bind to the client's IP+port when connecting */
+	CO_SRC_TPROXY_DYN  = 0x0004,    /* bind to a dynamically computed non-local address */
+	CO_SRC_TPROXY_MASK = 0x0007,    /* bind to a non-local address when connecting */
+
+	CO_SRC_BIND        = 0x0008,    /* bind to a specific source address when connecting */
+};
+
+
 /* xprt_ops describes transport-layer operations for a connection. They
  * generally run over a socket-based control layer, but not always. Some
  * of them are used for data transfer with the upper layer (rcv_*, snd_*)
@@ -175,6 +209,24 @@ struct data_cb {
 	int  (*init)(struct connection *conn);  /* data-layer initialization */
 };
 
+/* a connection source profile defines all the parameters needed to properly
+ * bind an outgoing connection for a server or proxy.
+ */
+
+struct conn_src {
+	unsigned int opts;                   /* CO_SRC_* */
+	int iface_len;                       /* bind interface name length */
+	char *iface_name;                    /* bind interface name or NULL */
+	struct port_range *sport_range;      /* optional per-server TCP source ports */
+	struct sockaddr_storage source_addr; /* the address to which we want to bind for connect() */
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
+	struct sockaddr_storage tproxy_addr; /* non-local address we want to bind to for connect() */
+	char *bind_hdr_name;                 /* bind to this header name if defined */
+	int bind_hdr_len;                    /* length of the name of the header above */
+	int bind_hdr_occ;                    /* occurrence number of header above: >0 = from first, <0 = from end, 0=disabled */
+#endif
+};
+
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
  * socket, and can also be made to an internal applet. It can support
@@ -186,7 +238,7 @@ struct connection {
 	const struct protocol *ctrl;  /* operations at the socket layer */
 	const struct xprt_ops *xprt;  /* operations at the transport layer */
 	const struct data_cb  *data;  /* data layer callbacks */
-	unsigned int flags;           /* CO_F_* */
+	unsigned int flags;           /* CO_FL_* */
 	int xprt_st;                  /* transport layer state, initialized to zero */
 	void *xprt_ctx;               /* general purpose pointer, initialized to NULL */
 	void *owner;                  /* pointer to upper layer's entity (eg: stream interface) */
@@ -195,6 +247,7 @@ struct connection {
 			int fd;       /* file descriptor for a stream driver when known */
 		} sock;
 	} t;
+	unsigned int err_code;        /* CO_ER_* */
 	enum obj_type *target;        /* the target to connect to (server, proxy, applet, ...) */
 	struct {
 		struct sockaddr_storage from;	/* client address, or address to spoof when connecting to the server */
