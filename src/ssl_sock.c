@@ -232,6 +232,9 @@ int ssl_sock_load_dh_params(SSL_CTX *ctx, const char *file)
 	}
 
 	ret = 0; /* DH params not found */
+
+	/* Clear openssl global errors stack */
+	ERR_clear_error();
 end:
 	if (dh)
 		DH_free(dh);
@@ -563,6 +566,7 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 			}
 		}
 #endif
+		ERR_clear_error();
 	}
 
 	if (global.tune.ssllifetime)
@@ -1003,6 +1007,9 @@ reneg_ok:
 	return 1;
 
  out_error:
+	/* Clear openssl global errors stack */
+	ERR_clear_error();
+
 	/* free resumed session if exists */
 	if (objt_server(conn->target) && objt_server(conn->target)->ssl_ctx.reused_sess) {
 		SSL_SESSION_free(objt_server(conn->target)->ssl_ctx.reused_sess);
@@ -1058,7 +1065,7 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 		ret = SSL_read(conn->xprt_ctx, bi_end(buf), try);
 		if (conn->flags & CO_FL_ERROR) {
 			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
-			break;
+			goto out_error;
 		}
 		if (ret > 0) {
 			buf->i += ret;
@@ -1069,6 +1076,16 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 			try = count;
 		}
 		else if (ret == 0) {
+			ret =  SSL_get_error(conn->xprt_ctx, ret);
+			if (ret != SSL_ERROR_ZERO_RETURN) {
+				/* error on protocol or underlying transport */
+				if ((ret != SSL_ERROR_SYSCALL)
+				     || (errno && (errno != EAGAIN)))
+					conn->flags |= CO_FL_ERROR;
+
+				/* Clear openssl global errors stack */
+				ERR_clear_error();
+			}
 			goto read0;
 		}
 		else {
@@ -1100,6 +1117,9 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 	conn_sock_read0(conn);
 	return done;
  out_error:
+	/* Clear openssl global errors stack */
+	ERR_clear_error();
+
 	conn->flags |= CO_FL_ERROR;
 	return done;
 }
@@ -1141,13 +1161,13 @@ static int ssl_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 		ret = SSL_write(conn->xprt_ctx, bo_ptr(buf), try);
 		if (conn->flags & CO_FL_ERROR) {
 			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
-			break;
+			goto out_error;
 		}
 		if (ret > 0) {
 			buf->o -= ret;
 			done += ret;
 
-			if (likely(!buffer_len(buf)))
+			if (likely(buffer_empty(buf)))
 				/* optimize data alignment in the buffer */
 				buf->p = buf->data;
 
@@ -1180,10 +1200,12 @@ static int ssl_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 	return done;
 
  out_error:
+	/* Clear openssl global errors stack */
+	ERR_clear_error();
+
 	conn->flags |= CO_FL_ERROR;
 	return done;
 }
-
 
 static void ssl_sock_close(struct connection *conn) {
 
@@ -1202,8 +1224,10 @@ static void ssl_sock_shutw(struct connection *conn, int clean)
 	if (conn->flags & CO_FL_HANDSHAKE)
 		return;
 	/* no handshake was in progress, try a clean ssl shutdown */
-	if (clean)
-		SSL_shutdown(conn->xprt_ctx);
+	if (clean && (SSL_shutdown(conn->xprt_ctx) <= 0)) {
+		/* Clear openssl global errors stack */
+		ERR_clear_error();
+	}
 
 	/* force flag on ssl to keep session in cache regardless shutdown result */
 	SSL_set_shutdown(conn->xprt_ctx, SSL_SENT_SHUTDOWN);
@@ -1422,7 +1446,7 @@ smp_fetch_ssl_c_serial(struct proxy *px, struct session *l4, void *l7, unsigned 
 	if (!crt)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (ssl_sock_get_serial(crt, smp_trash) <= 0)
 		goto out;
 
@@ -1457,7 +1481,7 @@ smp_fetch_ssl_c_notafter(struct proxy *px, struct session *l4, void *l7, unsigne
 	if (!crt)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (ssl_sock_get_time(X509_get_notAfter(crt), smp_trash) <= 0)
 		goto out;
 
@@ -1497,7 +1521,7 @@ smp_fetch_ssl_c_i_dn(struct proxy *px, struct session *l4, void *l7, unsigned in
 	if (!name)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (args && args[0].type == ARGT_STR) {
 		int pos = 1;
 
@@ -1543,7 +1567,7 @@ smp_fetch_ssl_c_notbefore(struct proxy *px, struct session *l4, void *l7, unsign
 	if (!crt)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (ssl_sock_get_time(X509_get_notBefore(crt), smp_trash) <= 0)
 		goto out;
 
@@ -1583,7 +1607,7 @@ smp_fetch_ssl_c_s_dn(struct proxy *px, struct session *l4, void *l7, unsigned in
 	if (!name)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (args && args[0].type == ARGT_STR) {
 		int pos = 1;
 
@@ -1606,6 +1630,33 @@ out:
 		X509_free(crt);
 	return ret;
 }
+
+/* integer, returns true if current session use a client certificate */
+static int
+smp_fetch_ssl_c_used(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	X509 *crt;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate returns a ptr on allocated X509 struct */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (crt) {
+		X509_free(crt);
+	}
+
+	smp->type = SMP_T_BOOL;
+	smp->data.uint = (crt != NULL);
+	return 1;
+}
+
 /* integer, returns the client certificate version */
 static int
 smp_fetch_ssl_c_version(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
@@ -1748,7 +1799,7 @@ smp_fetch_ssl_f_serial(struct proxy *px, struct session *l4, void *l7, unsigned 
 	if (!crt)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (ssl_sock_get_serial(crt, smp_trash) <= 0)
 		goto out;
 
@@ -1779,7 +1830,7 @@ smp_fetch_ssl_f_notafter(struct proxy *px, struct session *l4, void *l7, unsigne
 	if (!crt)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (ssl_sock_get_time(X509_get_notAfter(crt), smp_trash) <= 0)
 		goto out;
 
@@ -1811,7 +1862,7 @@ smp_fetch_ssl_f_notbefore(struct proxy *px, struct session *l4, void *l7, unsign
 	if (!crt)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (ssl_sock_get_time(X509_get_notBefore(crt), smp_trash) <= 0)
 		goto out;
 
@@ -1938,7 +1989,7 @@ smp_fetch_ssl_f_i_dn(struct proxy *px, struct session *l4, void *l7, unsigned in
 	if (!name)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (args && args[0].type == ARGT_STR) {
 		int pos = 1;
 
@@ -1986,7 +2037,7 @@ smp_fetch_ssl_f_s_dn(struct proxy *px, struct session *l4, void *l7, unsigned in
 	if (!name)
 		goto out;
 
-	smp_trash = sample_get_trash_chunk();
+	smp_trash = get_trash_chunk();
 	if (args && args[0].type == ARGT_STR) {
 		int pos = 1;
 
@@ -2745,6 +2796,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
 	{ "ssl_c_sig_alg",          smp_fetch_ssl_c_sig_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
 	{ "ssl_c_s_dn",             smp_fetch_ssl_c_s_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
 	{ "ssl_c_serial",           smp_fetch_ssl_c_serial,       0,    NULL,    SMP_T_BIN,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_used",             smp_fetch_ssl_c_used,         0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
 	{ "ssl_c_verify",           smp_fetch_ssl_c_verify,       0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
 	{ "ssl_c_version",          smp_fetch_ssl_c_version,      0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
 	{ "ssl_f_i_dn",             smp_fetch_ssl_f_i_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
@@ -2784,6 +2836,7 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "ssl_c_sig_alg",          acl_parse_str, smp_fetch_ssl_c_sig_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 	{ "ssl_c_s_dn",             acl_parse_str, smp_fetch_ssl_c_s_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
 	{ "ssl_c_serial",           acl_parse_bin, smp_fetch_ssl_c_serial,       acl_match_bin,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_used",             acl_parse_int, smp_fetch_ssl_c_used,         acl_match_nothing, ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 	{ "ssl_c_verify",           acl_parse_int, smp_fetch_ssl_c_verify,       acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 	{ "ssl_c_version",          acl_parse_int, smp_fetch_ssl_c_version,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 	{ "ssl_f_i_dn",             acl_parse_str, smp_fetch_ssl_f_i_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },

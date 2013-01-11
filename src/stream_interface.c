@@ -571,11 +571,11 @@ static int si_conn_wake_cb(struct connection *conn)
 		__conn_data_stop_recv(conn);
 		si->ib->rex = TICK_ETERNITY;
 	}
-	else if ((si->ib->flags & (CF_SHUTR|CF_READ_PARTIAL|CF_DONT_READ|CF_READ_NOEXP)) == CF_READ_PARTIAL &&
+	else if ((si->ib->flags & (CF_SHUTR|CF_READ_PARTIAL|CF_DONT_READ)) == CF_READ_PARTIAL &&
 		 !channel_full(si->ib)) {
 		/* we must re-enable reading if si_chk_snd() has freed some space */
 		__conn_data_want_recv(conn);
-		if (tick_isset(si->ib->rex))
+		if (!(si->ib->flags & CF_READ_NOEXP) && tick_isset(si->ib->rex))
 			si->ib->rex = tick_add_ifset(now_ms, si->ib->rto);
 	}
 
@@ -765,17 +765,20 @@ static void stream_int_chk_rcv_conn(struct stream_interface *si)
 	if (unlikely(si->state > SI_ST_EST || (ib->flags & CF_SHUTR)))
 		return;
 
+	conn_refresh_polling_flags(si->conn);
+
 	if ((ib->flags & CF_DONT_READ) || channel_full(ib)) {
 		/* stop reading */
 		if (!(ib->flags & CF_DONT_READ)) /* full */
 			si->flags |= SI_FL_WAIT_ROOM;
-		conn_data_stop_recv(si->conn);
+		__conn_data_stop_recv(si->conn);
 	}
 	else {
 		/* (re)start reading */
 		si->flags &= ~SI_FL_WAIT_ROOM;
-		conn_data_want_recv(si->conn);
+		__conn_data_want_recv(si->conn);
 	}
+	conn_cond_update_data_polling(si->conn);
 }
 
 
@@ -795,8 +798,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 		return;
 
 	if (!ob->pipe &&                          /* spliced data wants to be forwarded ASAP */
-	    (!(si->flags & SI_FL_WAIT_DATA) ||    /* not waiting for data */
-	     (fdtab[si->conn->t.sock.fd].ev & FD_POLL_OUT)))   /* we'll be called anyway */
+	    !(si->flags & SI_FL_WAIT_DATA))       /* not waiting for data */
 		return;
 
 	if (!(si->conn->flags & (CO_FL_HANDSHAKE|CO_FL_WAIT_L4_CONN|CO_FL_WAIT_L6_CONN))) {
@@ -805,8 +807,8 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 		 */
 		if (si->conn->ctrl)
 			fd_want_send(si->conn->t.sock.fd);
-		si->conn->flags &= ~(CO_FL_WAIT_DATA|CO_FL_WAIT_ROOM|CO_FL_WAIT_RD|CO_FL_WAIT_WR);
-		si->conn->flags |= CO_FL_CURR_WR_ENA;
+
+		conn_refresh_polling_flags(si->conn);
 
 		if (si_conn_send_loop(si->conn) < 0) {
 			/* Write error on the file descriptor */
@@ -1035,6 +1037,7 @@ static void si_conn_recv_cb(struct connection *conn)
 		}
 
 		if ((chn->flags & CF_READ_DONTWAIT) || --read_poll <= 0) {
+			si->flags |= SI_FL_WAIT_ROOM;
 			__conn_data_stop_recv(conn);
 			break;
 		}
