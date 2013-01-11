@@ -1,3 +1,11 @@
+haproxy (1.5.17) precise; urgency=low
+
+  * Please check on the source CHANGELOG file for more information
+    or http://haproxy.1wt.eu/download/1.5/src/CHANGELOG
+  * This packages was built using the development 1.5-dev17 release
+
+ -- Marcelo Martins <btorch@gmail.com>  Fri, 11 Jan 2013 21:10:29 +0000
+
 haproxy (1.5.15) precise; urgency=low
 
   * Please check on the source CHANGELOG file for more information
