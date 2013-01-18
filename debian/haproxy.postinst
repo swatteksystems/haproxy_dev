@@ -8,4 +8,8 @@ GROUP=haproxy
 groups "$GROUP" > /dev/null 2>&1 || addgroup --system "$GROUP"
 id "$USER" > /dev/null 2>&1 || adduser --system --no-create-home --ingroup "$GROUP" "$USER"
 
+mkdir /var/run/haproxy 
+mkdir /var/log/haproxy
+chgrp adm /var/log/haproxy
+
 #DEBHELPER#
