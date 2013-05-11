@@ -1,2 +1,0 @@
-version=3
-http://haproxy.1wt.eu/ download/(.*)/haproxy-([\d\.]+)\.tar\.gz$
