@@ -12,6 +12,14 @@ src/*.o
 *.log*
 *.trace*
 haproxy-*
+<<<<<<< HEAD
 make-*
 dlmalloc.c
 00*.patch
+=======
+!src/*.c
+make-*
+dlmalloc.c
+00*.patch
+*.service
+>>>>>>> 06da4df056c745f76f1d3437d25d969daef5da46
