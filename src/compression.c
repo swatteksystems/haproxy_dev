@@ -613,7 +613,7 @@ int deflate_end(struct comp_ctx **comp_ctx)
 /* boolean, returns true if compression is used (either gzip or deflate) in the response */
 static int
 smp_fetch_res_comp(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                 const struct arg *args, struct sample *smp)
+                 const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->type = SMP_T_BOOL;
 	smp->data.uint = (l4->comp_algo != NULL);
@@ -623,7 +623,7 @@ smp_fetch_res_comp(struct proxy *px, struct session *l4, void *l7, unsigned int 
 /* string, returns algo */
 static int
 smp_fetch_res_comp_algo(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                 const struct arg *args, struct sample *smp)
+                 const struct arg *args, struct sample *smp, const char *kw)
 {
 	if (!l4->comp_algo)
 		return 0;
@@ -635,13 +635,12 @@ smp_fetch_res_comp_algo(struct proxy *px, struct session *l4, void *l7, unsigned
 }
 
 /* Note: must not be declared <const> as its list will be overwritten */
-static struct acl_kw_list acl_kws = {{ },{
-	{ "res.comp",          NULL,            acl_parse_nothing,     acl_match_nothing  },
+static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 
 /* Note: must not be declared <const> as its list will be overwritten */
-static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
+static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "res.comp",             smp_fetch_res_comp,      0,                NULL,    SMP_T_BOOL, SMP_USE_HRSHP },
 	{ "res.comp_algo",        smp_fetch_res_comp_algo, 0,                NULL,    SMP_T_STR, SMP_USE_HRSHP },
 	{ /* END */ },

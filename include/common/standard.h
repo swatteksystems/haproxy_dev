@@ -508,8 +508,22 @@ static inline unsigned int popcount(unsigned int a)
 	return cnt;
 }
 
+/*
+ * Parse binary string written in hexadecimal (source) and store the decoded
+ * result into binstr and set binstrlen to the lengh of binstr. Memory for
+ * binstr is allocated by the function. In case of error, returns 0 with an
+ * error message in err.
+ */
+int parse_binary(const char *source, char **binstr, int *binstrlen, char **err);
+
 /* copies at most <n> characters from <src> and always terminates with '\0' */
 char *my_strndup(const char *src, int n);
+
+/*
+ * search needle in haystack
+ * returns the pointer if found, returns NULL otherwise
+ */
+const void *my_memmem(const void *, size_t, const void *, size_t);
 
 /* This function returns the first unused key greater than or equal to <key> in
  * ID tree <root>. Zero is returned if no place is found.
@@ -527,6 +541,7 @@ int word_match(const char *sample, int slen, const char *word, int wlen);
  * or the number of chars read in case of success.
  */
 int buf2ip(const char *buf, size_t len, struct in_addr *dst);
+int buf2ip6(const char *buf, size_t len, struct in6_addr *dst);
 
 /* To be used to quote config arg positions. Returns the string at <ptr>
  * surrounded by simple quotes if <ptr> is valid and non-empty, or "end of line"
@@ -745,7 +760,70 @@ char *env_expand(char *in);
  */
 #define fddebug(msg...) do { char *_m = NULL; memprintf(&_m, ##msg); if (_m) write(-1, _m, strlen(_m)); free(_m); } while (0)
 
+/* used from everywhere just to drain results we don't want to read and which
+ * recent versions of gcc increasingly and annoyingly complain about.
+ */
+extern int shut_your_big_mouth_gcc_int;
+
+/* used from everywhere just to drain results we don't want to read and which
+ * recent versions of gcc increasingly and annoyingly complain about.
+ */
+static inline void shut_your_big_mouth_gcc(int r)
+{
+	shut_your_big_mouth_gcc_int = r;
+}
+
 /* same as strstr() but case-insensitive */
 const char *strnistr(const char *str1, int len_str1, const char *str2, int len_str2);
+
+
+/************************* Composite address manipulation *********************
+ * Composite addresses are simply unsigned long data in which the higher bits
+ * represent a pointer, and the two lower bits are flags. There are several
+ * places where we just want to associate one or two flags to a pointer (eg,
+ * to type it), and these functions permit this. The pointer is necessarily a
+ * 32-bit aligned pointer, as its two lower bits will be cleared and replaced
+ * with the flags.
+ *****************************************************************************/
+
+/* Masks the two lower bits of a composite address and converts it to a
+ * pointer. This is used to mix some bits with some aligned pointers to
+ * structs and to retrieve the original (32-bit aligned) pointer.
+ */
+static inline void *caddr_to_ptr(unsigned long caddr)
+{
+	return (void *)(caddr & ~3UL);
+}
+
+/* Only retrieves the two lower bits of a composite address. This is used to mix
+ * some bits with some aligned pointers to structs and to retrieve the original
+ * data (2 bits).
+ */
+static inline unsigned int caddr_to_data(unsigned long caddr)
+{
+	return (caddr & 3UL);
+}
+
+/* Combines the aligned pointer whose 2 lower bits will be masked with the bits
+ * from <data> to form a composite address. This is used to mix some bits with
+ * some aligned pointers to structs and to retrieve the original (32-bit aligned)
+ * pointer.
+ */
+static inline unsigned long caddr_from_ptr(void *ptr, unsigned int data)
+{
+	return (((unsigned long)ptr) & ~3UL) + (data & 3);
+}
+
+/* sets the 2 bits of <data> in the <caddr> composite address */
+static inline unsigned long caddr_set_flags(unsigned long caddr, unsigned int data)
+{
+	return caddr | (data & 3);
+}
+
+/* clears the 2 bits of <data> in the <caddr> composite address */
+static inline unsigned long caddr_clr_flags(unsigned long caddr, unsigned int data)
+{
+	return caddr & ~(unsigned long)(data & 3);
+}
 
 #endif /* _COMMON_STANDARD_H */

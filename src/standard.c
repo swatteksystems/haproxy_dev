@@ -1047,13 +1047,13 @@ char *encode_string(char *start, char *stop,
 
 /* Decode an URL-encoded string in-place. The resulting string might
  * be shorter. If some forbidden characters are found, the conversion is
- * aborted, the string is truncated before the issue and non-zero is returned,
- * otherwise the operation returns non-zero indicating success.
+ * aborted, the string is truncated before the issue and a negative value is
+ * returned, otherwise the operation returns the length of the decoded string.
  */
 int url_decode(char *string)
 {
 	char *in, *out;
-	int ret = 0;
+	int ret = -1;
 
 	in = string;
 	out = string;
@@ -1074,7 +1074,7 @@ int url_decode(char *string)
 		}
 		in++;
 	}
-	ret = 1; /* success */
+	ret = out - string; /* success */
  end:
 	*out = 0;
 	return ret;
@@ -1356,6 +1356,62 @@ const char *parse_size_err(const char *text, unsigned *ret) {
 	return NULL;
 }
 
+/*
+ * Parse binary string written in hexadecimal (source) and store the decoded
+ * result into binstr and set binstrlen to the lengh of binstr. Memory for
+ * binstr is allocated by the function. In case of error, returns 0 with an
+ * error message in err. In succes case, it returns the consumed length.
+ */
+int parse_binary(const char *source, char **binstr, int *binstrlen, char **err)
+{
+	int len;
+	const char *p = source;
+	int i,j;
+	int alloc;
+
+	len = strlen(source);
+	if (len % 2) {
+		memprintf(err, "an even number of hex digit is expected");
+		return 0;
+	}
+
+	len = len >> 1;
+
+	if (!*binstr) {
+		*binstr = calloc(len, sizeof(char));
+		if (!*binstr) {
+			memprintf(err, "out of memory while loading string pattern");
+			return 0;
+		}
+		alloc = 1;
+	}
+	else {
+		if (*binstrlen < len) {
+			memprintf(err, "no space avalaible in the buffer. expect %d, provides %d",
+			          len, *binstrlen);
+			return 0;
+		}
+		alloc = 0;
+	}
+	*binstrlen = len;
+
+	i = j = 0;
+	while (j < len) {
+		if (!ishex(p[i++]))
+			goto bad_input;
+		if (!ishex(p[i++]))
+			goto bad_input;
+		(*binstr)[j++] =  (hex2i(p[i-2]) << 4) + hex2i(p[i-1]);
+	}
+	return len << 1;
+
+bad_input:
+	memprintf(err, "an hex digit is expected (found '%c')", p[i-1]);
+	if (alloc)
+		free(binstr);
+	return 0;
+}
+
 /* copies at most <n> characters from <src> and always terminates with '\0' */
 char *my_strndup(const char *src, int n)
 {
@@ -1371,6 +1427,31 @@ char *my_strndup(const char *src, int n)
 	memcpy(ret, src, len);
 	ret[len] = '\0';
 	return ret;
+}
+
+/*
+ * search needle in haystack
+ * returns the pointer if found, returns NULL otherwise
+ */
+const void *my_memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen)
+{
+	const void *c = NULL;
+	unsigned char f;
+
+	if ((haystack == NULL) || (needle == NULL) || (haystacklen < needlelen))
+		return NULL;
+
+	f = *(char *)needle;
+	c = haystack;
+	while ((c = memchr(c, f, haystacklen - (c - haystack))) != NULL) {
+		if ((haystacklen - (c - haystack)) < needlelen)
+			return NULL;
+
+		if (memcmp(c, needle, needlelen) == 0)
+			return c;
+		++c;
+	}
+	return NULL;
 }
 
 /* This function returns the first unused key greater than or equal to <key> in
@@ -1577,6 +1658,7 @@ unsigned int inetaddr_host_lim_ret(char *text, char *stop, char **ret)
  * or the number of chars read in case of success. Maybe this could be replaced
  * by one of the functions above. Also, apparently this function does not support
  * hosts above 255 and requires exactly 4 octets.
+ * The destination is only modified on success.
  */
 int buf2ip(const char *buf, size_t len, struct in_addr *dst)
 {
@@ -1623,6 +1705,29 @@ int buf2ip(const char *buf, size_t len, struct in_addr *dst)
 
 	memcpy(&dst->s_addr, tmp, 4);
 	return addr - cp;
+}
+
+/* This function converts the string in <buf> of the len <len> to
+ * struct in6_addr <dst> which must be allocated by the caller.
+ * This function returns 1 in success case, otherwise zero.
+ * The destination is only modified on success.
+ */
+int buf2ip6(const char *buf, size_t len, struct in6_addr *dst)
+{
+	char null_term_ip6[INET6_ADDRSTRLEN + 1];
+	struct in6_addr out;
+
+	if (len > INET6_ADDRSTRLEN)
+		return 0;
+
+	memcpy(null_term_ip6, buf, len);
+	null_term_ip6[len] = '\0';
+
+	if (!inet_pton(AF_INET6, null_term_ip6, &out))
+		return 0;
+
+	*dst = out;
+	return 1;
 }
 
 /* To be used to quote config arg positions. Returns the short string at <ptr>
@@ -1700,11 +1805,16 @@ const char rfc4291_pfx[] = { 0x00, 0x00, 0x00, 0x00,
 			     0x00, 0x00, 0x00, 0x00,
 			     0x00, 0x00, 0xFF, 0xFF };
 
-/* Map IPv4 adress on IPv6 address, as specified in RFC 3513. */
+/* Map IPv4 adress on IPv6 address, as specified in RFC 3513.
+ * Input and output may overlap.
+ */
 void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr)
 {
+	struct in_addr tmp_addr;
+
+	tmp_addr.s_addr = sin_addr->s_addr;
 	memcpy(sin6_addr->s6_addr, rfc4291_pfx, sizeof(rfc4291_pfx));
-	memcpy(sin6_addr->s6_addr+12, &sin_addr->s_addr, 4);
+	memcpy(sin6_addr->s6_addr+12, &tmp_addr.s_addr, 4);
 }
 
 /* Map IPv6 adress on IPv4 address, as specified in RFC 3513.

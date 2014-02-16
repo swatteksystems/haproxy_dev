@@ -40,8 +40,13 @@
 #define MAXREWRITE      (BUFSIZE / 2)
 #endif
 
+#ifndef REQURI_LEN
 #define REQURI_LEN      1024
+#endif
+
+#ifndef CAPTURE_LEN
 #define CAPTURE_LEN     64
+#endif
 
 // maximum line size when parsing config
 #ifndef LINESIZE
@@ -52,7 +57,8 @@
 #define MAX_LINE_ARGS   64
 
 // max # args on a stats socket
-#define MAX_STATS_ARGS  16
+// This should cover at least 5 + twice the # of data_types
+#define MAX_STATS_ARGS  64
 
 // max # of matches per regexp
 #define	MAX_MATCH       10
@@ -66,6 +72,11 @@
 // max # of headers in history when looking for header #-X
 #ifndef MAX_HDR_HISTORY
 #define MAX_HDR_HISTORY 10
+#endif
+
+// max # of stick counters per session (at least 3 for sc0..sc2)
+#ifndef MAX_SESS_STKCTR
+#define MAX_SESS_STKCTR 3
 #endif
 
 // max # of loops we can perform around a read() which succeeds.
@@ -114,6 +125,8 @@
 #define	DEF_CHKINTR     2000
 #define DEF_FALLTIME    3
 #define DEF_RISETIME    2
+#define DEF_AGENT_FALLTIME    1
+#define DEF_AGENT_RISETIME    1
 #define DEF_CHECK_REQ   "OPTIONS / HTTP/1.0\r\n"
 #define DEF_SMTP_CHECK_REQ   "HELO localhost\r\n"
 #define DEF_LDAP_CHECK_REQ   "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"

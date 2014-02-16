@@ -64,6 +64,13 @@
 #define MSG_MORE	0
 #endif
 
+/* On Linux 2.4 and above, MSG_TRUNC can be used on TCP sockets to drop any
+ * pending data. Let's rely on NETFILTER to detect if this is supported.
+ */
+#ifdef NETFILTER
+#define MSG_TRUNC_CLEARS_INPUT
+#endif
+
 /* Maximum path length, OS-dependant */
 #ifndef MAXPATHLEN
 #define MAXPATHLEN 128
@@ -120,6 +127,14 @@
 #ifndef TCP_FASTOPEN
 #define TCP_FASTOPEN 23
 #endif
+#endif
+
+/* If IPv6 is supported, define IN6_IS_ADDR_V4MAPPED() if missing. */
+#if defined(IPV6_TCLASS) && !defined(IN6_IS_ADDR_V4MAPPED)
+#define IN6_IS_ADDR_V4MAPPED(a) \
+((((const uint32_t *) (a))[0] == 0) \
+&& (((const uint32_t *) (a))[1] == 0) \
+&& (((const uint32_t *) (a))[2] == htonl (0xffff)))
 #endif
 
 #if defined(__dietlibc__)

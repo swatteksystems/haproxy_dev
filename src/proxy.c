@@ -406,7 +406,7 @@ int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 	}
 	if (curproxy->to_log & (LW_REQ | LW_RESP)) {
 		curproxy->to_log &= ~(LW_REQ | LW_RESP);
-		Warning("parsing [%s:%d] : 'option httplog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
+		Warning("parsing [%s:%d] : HTTP log/header format not usable with %s '%s' (needs 'mode http').\n",
 			curproxy->conf.lfs_file, curproxy->conf.lfs_line,
 			proxy_type_str(curproxy), curproxy->id);
 	}
@@ -433,6 +433,7 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->pendconns);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
+	LIST_INIT(&p->http_res_rules);
 	LIST_INIT(&p->block_cond);
 	LIST_INIT(&p->redirect_rules);
 	LIST_INIT(&p->mon_fail_cond);
@@ -453,6 +454,7 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->conf.bind);
 	LIST_INIT(&p->conf.listeners);
 	LIST_INIT(&p->conf.args.list);
+	LIST_INIT(&p->tcpcheck_rules);
 
 	/* Timeouts are defined as -1 */
 	proxy_reset_timeouts(p);
@@ -556,6 +558,24 @@ struct task *manage_proxy(struct task *t)
 		}
 		else {
 			next = tick_first(next, p->stop_time);
+		}
+	}
+
+	/* If the proxy holds a stick table, we need to purge all unused
+	 * entries. These are all the ones in the table with ref_cnt == 0
+	 * and all the ones in the pool used to allocate new entries. Any
+	 * entry attached to an existing session waiting for a store will
+	 * be in neither list. Any entry being dumped will have ref_cnt > 0.
+	 * However we protect tables that are being synced to peers.
+	 */
+	if (unlikely(stopping && p->state == PR_STSTOPPED && p->table.current)) {
+		if (!p->table.syncing) {
+			stktable_trash_oldest(&p->table, p->table.current);
+			pool_gc2();
+		}
+		if (p->table.current) {
+			/* some entries still remain, let's recheck in one second */
+			next = tick_first(next, tick_add(now_ms, 1000));
 		}
 	}
 
@@ -858,7 +878,7 @@ int session_set_backend(struct session *s, struct proxy *be)
 	return 1;
 }
 
-static struct cfg_kw_list cfg_kws = {{ },{
+static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "timeout", proxy_parse_timeout },
 	{ CFG_LISTEN, "clitimeout", proxy_parse_timeout },
 	{ CFG_LISTEN, "contimeout", proxy_parse_timeout },

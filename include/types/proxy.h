@@ -50,19 +50,21 @@
 #include <types/stick_table.h>
 
 /* values for proxy->state */
-enum {
+enum pr_state {
 	PR_STNEW = 0,           /* proxy has not been initialized yet */
 	PR_STREADY,             /* proxy has been initialized and is ready */
 	PR_STFULL,              /* frontend is full (maxconn reached) */
 	PR_STPAUSED,            /* frontend is paused (during hot restart) */
 	PR_STSTOPPED,           /* proxy is stopped (end of a restart) */
 	PR_STERROR,             /* proxy experienced an unrecoverable error */
-};
+} __attribute__((packed));
 
 /* values for proxy->mode */
-#define PR_MODE_TCP     0
-#define PR_MODE_HTTP    1
-#define PR_MODE_HEALTH  2
+enum pr_mode {
+	PR_MODE_TCP = 0,
+	PR_MODE_HTTP,
+	PR_MODE_HEALTH,
+} __attribute__((packed));
 
 /* flag values for proxy->cap. This is a bitmask of capabilities supported by the proxy */
 #define PR_CAP_NONE    0x0000
@@ -74,9 +76,10 @@ enum {
 /* bits for proxy->options */
 #define PR_O_REDISP     0x00000001      /* allow reconnection to dispatch in case of errors */
 #define PR_O_TRANSP     0x00000002      /* transparent mode : use original DEST as dispatch */
-/* unused: 0x04, 0x08, 0x10, 0x20 */
+/* unused: 0x04, 0x08, 0x10 */
+#define PR_O_PREF_LAST  0x00000020      /* prefer last server */
 #define PR_O_DISPATCH   0x00000040      /* use dispatch mode */
-#define PR_O_KEEPALIVE  0x00000080      /* follow keep-alive sessions */
+/* unused: 0x00000080 */
 #define PR_O_FWDFOR     0x00000100      /* conditionally insert x-forwarded-for with client address */
 /* unused: 0x00000200 */
 #define PR_O_NULLNOLOG  0x00000400      /* a connect without request will not be logged */
@@ -84,17 +87,24 @@ enum {
 #define PR_O_FF_ALWAYS  0x00002000      /* always set x-forwarded-for */
 #define PR_O_PERSIST    0x00004000      /* server persistence stays effective even when server is down */
 #define PR_O_LOGASAP    0x00008000      /* log as soon as possible, without waiting for the session to complete */
-#define PR_O_HTTP_CLOSE 0x00010000      /* force 'connection: close' in both directions */
+/* unused: 0x00010000 */
 #define PR_O_CHK_CACHE  0x00020000      /* require examination of cacheability of the 'set-cookie' field */
 #define PR_O_TCP_CLI_KA 0x00040000      /* enable TCP keep-alive on client-side sessions */
 #define PR_O_TCP_SRV_KA 0x00080000      /* enable TCP keep-alive on server-side sessions */
 #define PR_O_USE_ALL_BK 0x00100000      /* load-balance between backup servers */
-#define PR_O_FORCE_CLO  0x00200000      /* enforce the connection close immediately after server response */
+/* unused: 0x00020000 */
 #define PR_O_TCP_NOLING 0x00400000      /* disable lingering on client and server connections */
 #define PR_O_ABRT_CLOSE 0x00800000      /* immediately abort request when client closes */
 
-/* unused: 0x01000000, 0x02000000, 0x04000000 */
-#define PR_O_SERVER_CLO 0x08000000	/* option http-server-close */
+/* unused: 0x01000000, 0x02000000, 0x04000000, 0x08000000 */
+#define PR_O_HTTP_KAL   0x00000000      /* HTTP keep-alive mode (http-keep-alive) */
+#define PR_O_HTTP_PCL   0x01000000      /* HTTP passive close mode (httpclose) = tunnel with Connection: close */
+#define PR_O_HTTP_FCL   0x02000000      /* HTTP forced close mode (forceclose) */
+#define PR_O_HTTP_SCL   0x03000000      /* HTTP server close mode (http-server-close) */
+#define PR_O_HTTP_TUN   0x04000000      /* HTTP tunnel mode : no analysis past first request/response */
+/* unassigned values : 0x05000000, 0x06000000, 0x07000000 */
+#define PR_O_HTTP_MODE  0x07000000      /* MASK to retrieve the HTTP mode */
+#define PR_O_TCPCHK_SSL 0x08000000	/* at least one TCPCHECK connect rule requires SSL */
 #define PR_O_CONTSTATS	0x10000000	/* continous counters */
 #define PR_O_HTTP_PROXY 0x20000000	/* Enable session to use HTTP proxy operations */
 #define PR_O_DISABLE404 0x40000000      /* Disable a server on a 404 response to a health-check */
@@ -152,7 +162,8 @@ enum {
 #define PR_O2_LDAP_CHK  0x60000000      /* use LDAP check for server health */
 #define PR_O2_SSL3_CHK  0x70000000      /* use SSLv3 CLIENT_HELLO packets for server health */
 #define PR_O2_LB_AGENT_CHK 0x80000000   /* use a TCP connection to obtain a metric of server health */
-/* unused: 0x90000000 to 0xF000000, reserved for health checks */
+#define PR_O2_TCPCHK_CHK 0x90000000     /* use TCPCHK check for server health */
+/* unused: 0xA0000000 to 0xF000000, reserved for health checks */
 #define PR_O2_CHK_ANY   0xF0000000      /* Mask to cover any check */
 /* end of proxy->options2 */
 
@@ -197,21 +208,25 @@ struct error_snapshot {
 
 struct proxy {
 	enum obj_type obj_type;                 /* object type == OBJ_TYPE_PROXY */
-	int state;				/* proxy state */
+	enum pr_state state;                    /* proxy state, one of PR_* */
+	enum pr_mode mode;                      /* mode = PR_MODE_TCP, PR_MODE_HTTP or PR_MODE_HEALTH */
+	char cap;                               /* supported capabilities (PR_CAP_*) */
+	unsigned int maxconn;                   /* max # of active sessions on the frontend */
+
 	int options;				/* PR_O_REDISP, PR_O_TRANSP, ... */
 	int options2;				/* PR_O2_* */
 	struct in_addr mon_net, mon_mask;	/* don't forward connections from this net (network order) FIXME: should support IPv6 */
 	unsigned int ck_opts;			/* PR_CK_* (cookie options) */
 	unsigned int fe_req_ana, be_req_ana;	/* bitmap of common request protocol analysers for the frontend and backend */
 	unsigned int fe_rsp_ana, be_rsp_ana;	/* bitmap of common response protocol analysers for the frontend and backend */
-	int mode;				/* mode = PR_MODE_TCP, PR_MODE_HTTP or PR_MODE_HEALTH */
 	unsigned int http_needed;               /* non-null if HTTP analyser may be used */
 	union {
 		struct proxy *be;		/* default backend, or NULL if none set */
 		char *name;			/* default backend name during config parse */
 	} defbe;
 	struct list acl;                        /* ACL declared on this proxy */
-	struct list http_req_rules;		/* HTTP request rules: allow/deny/http-auth */
+	struct list http_req_rules;		/* HTTP request rules: allow/deny/... */
+	struct list http_res_rules;		/* HTTP response rules: allow/deny/... */
 	struct list block_cond;                 /* early blocking conditions (chained) */
 	struct list redirect_rules;             /* content redirecting rules (chained) */
 	struct list switching_rules;            /* content switching rules (chained) */
@@ -279,7 +294,6 @@ struct proxy {
 	struct freq_ctr fe_conn_per_sec;	/* received connections per second on the frontend */
 	struct freq_ctr fe_sess_per_sec;	/* accepted sessions per second on the frontend (after tcp rules) */
 	struct freq_ctr be_sess_per_sec;	/* sessions per second on the backend */
-	unsigned int maxconn;			/* max # of active sessions on the frontend */
 	unsigned int fe_sps_lim;		/* limit on new sessions per second on the frontend */
 	unsigned int fullconn;			/* #conns on backend above which servers are used at full load */
 	struct in_addr except_net, except_mask; /* don't x-forward-for for this address. FIXME: should support IPv6 */
@@ -297,7 +311,6 @@ struct proxy {
 	time_t last_change;			/* last time, when the state was changed */
 
 	int conn_retries;			/* maximum number of connect retries */
-	int cap;				/* supported capabilities (PR_CAP_*) */
 	int (*accept)(struct session *s);       /* application layer's accept() */
 	struct conn_src conn_src;               /* connection source settings */
 	struct proxy *next;
@@ -323,6 +336,7 @@ struct proxy {
 
 	struct task *task;			/* the associated task, mandatory to manage rate limiting, stopping and resource shortage, NULL if disabled */
 	int grace;				/* grace time after stop request */
+	struct list tcpcheck_rules;		/* tcp-check send / expect rules */
 	char *check_req;			/* HTTP or SSL request to use for PR_O_HTTP_CHK|PR_O_SSL3_CHK */
 	int check_len;				/* Length of the HTTP or SSL3 request */
 	char *expect_str;			/* http-check expected content : string or text version of the regex */
@@ -402,6 +416,7 @@ struct redirect_rule {
 	int type;
 	int rdr_len;
 	char *rdr_str;
+	struct list rdr_fmt;
 	int code;
 	unsigned int flags;
 	int cookie_len;

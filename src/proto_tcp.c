@@ -51,6 +51,7 @@
 #include <proto/sample.h>
 #include <proto/session.h>
 #include <proto/stick_table.h>
+#include <proto/stream_interface.h>
 #include <proto/task.h>
 
 #ifdef CONFIG_HAP_CTTPROXY
@@ -77,6 +78,7 @@ static struct protocol proto_tcpv4 = {
 	.enable_all = enable_all_listeners,
 	.get_src = tcp_get_src,
 	.get_dst = tcp_get_dst,
+	.drain = tcp_drain,
 	.listeners = LIST_HEAD_INIT(proto_tcpv4.listeners),
 	.nb_listeners = 0,
 };
@@ -98,6 +100,7 @@ static struct protocol proto_tcpv6 = {
 	.enable_all = enable_all_listeners,
 	.get_src = tcp_get_src,
 	.get_dst = tcp_get_dst,
+	.drain = tcp_drain,
 	.listeners = LIST_HEAD_INIT(proto_tcpv6.listeners),
 	.nb_listeners = 0,
 };
@@ -254,6 +257,8 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
  *   - 1 = delayed ACK if backend has tcp-smart-connect, regardless of data
  *   - 2 = delayed ACK regardless of backend options
  *
+ * Note that a pending send_proxy message accounts for data.
+ *
  * It can return one of :
  *  - SN_ERR_NONE if everything's OK
  *  - SN_ERR_SRVTO if there are no more servers
@@ -274,6 +279,8 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 	struct proxy *be;
 	struct conn_src *src;
 
+	conn->flags = CO_FL_WAIT_L4_CONN; /* connection in progress */
+
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
 		be = objt_proxy(conn->target);
@@ -284,25 +291,39 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 		be = srv->proxy;
 		break;
 	default:
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_INTERNAL;
 	}
 
 	if ((fd = conn->t.sock.fd = socket(conn->addr.to.ss_family, SOCK_STREAM, IPPROTO_TCP)) == -1) {
 		qfprintf(stderr, "Cannot get a server socket.\n");
 
-		if (errno == ENFILE)
+		if (errno == ENFILE) {
+			conn->err_code = CO_ER_SYS_FDLIM;
 			send_log(be, LOG_EMERG,
 				 "Proxy %s reached system FD limit at %d. Please check system tunables.\n",
 				 be->id, maxfd);
-		else if (errno == EMFILE)
+		}
+		else if (errno == EMFILE) {
+			conn->err_code = CO_ER_PROC_FDLIM;
 			send_log(be, LOG_EMERG,
 				 "Proxy %s reached process FD limit at %d. Please check 'ulimit-n' and restart.\n",
 				 be->id, maxfd);
-		else if (errno == ENOBUFS || errno == ENOMEM)
+		}
+		else if (errno == ENOBUFS || errno == ENOMEM) {
+			conn->err_code = CO_ER_SYS_MEMLIM;
 			send_log(be, LOG_EMERG,
 				 "Proxy %s reached system memory limit at %d sockets. Please check system tunables.\n",
 				 be->id, maxfd);
+		}
+		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
+			conn->err_code = CO_ER_NOPROTO;
+		}
+		else
+			conn->err_code = CO_ER_SOCK_ERR;
+
 		/* this is a resource error */
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_RESOURCE;
 	}
 
@@ -312,6 +333,8 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 		 */
 		Alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
 		close(fd);
+		conn->err_code = CO_ER_CONF_FDLIM;
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_PRXCOND; /* it is a configuration limit */
 	}
 
@@ -319,6 +342,8 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 	    (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == -1)) {
 		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
 		close(fd);
+		conn->err_code = CO_ER_SOCK_ERR;
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_INTERNAL;
 	}
 
@@ -377,17 +402,23 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 				attempts--;
 
 				fdinfo[fd].local_port = port_range_alloc_port(src->sport_range);
-				if (!fdinfo[fd].local_port)
+				if (!fdinfo[fd].local_port) {
+					conn->err_code = CO_ER_PORT_RANGE;
 					break;
+				}
 
 				fdinfo[fd].port_range = src->sport_range;
 				set_host_port(&sa, fdinfo[fd].local_port);
 
 				ret = tcp_bind_socket(fd, flags, &sa, &conn->addr.from);
+				if (ret != 0)
+					conn->err_code = CO_ER_CANT_BIND;
 			} while (ret != 0); /* binding NOK */
 		}
 		else {
 			ret = tcp_bind_socket(fd, flags, &src->source_addr, &conn->addr.from);
+			if (ret != 0)
+				conn->err_code = CO_ER_CANT_BIND;
 		}
 
 		if (unlikely(ret != 0)) {
@@ -408,9 +439,13 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 					 "Cannot bind to tproxy source address before connect() for backend %s.\n",
 					 be->id);
 			}
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_RESOURCE;
 		}
 	}
+
+	/* if a send_proxy is there, there are data */
+	data |= conn->send_proxy_ofs;
 
 #if defined(TCP_QUICKACK)
 	/* disabling tcp quick ack now allows the first request to leave the
@@ -432,22 +467,29 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 
 		if (errno == EAGAIN || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
 			char *msg;
-			if (errno == EAGAIN || errno == EADDRNOTAVAIL)
+			if (errno == EAGAIN || errno == EADDRNOTAVAIL) {
 				msg = "no free ports";
-			else
+				conn->err_code = CO_ER_FREE_PORTS;
+			}
+			else {
 				msg = "local address already in use";
+				conn->err_code = CO_ER_ADDR_INUSE;
+			}
 
 			qfprintf(stderr,"Connect() failed for backend %s: %s.\n", be->id, msg);
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
 			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s.\n", be->id, msg);
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_RESOURCE;
 		} else if (errno == ETIMEDOUT) {
 			//qfprintf(stderr,"Connect(): ETIMEDOUT");
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
+			conn->err_code = CO_ER_SOCK_ERR;
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_SRVTO;
 		} else {
 			// (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EACCES || errno == EPERM)
@@ -455,20 +497,25 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
+			conn->err_code = CO_ER_SOCK_ERR;
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_SRVCL;
 		}
 	}
 
-	fdtab[fd].owner = conn;
-	conn->flags  = CO_FL_WAIT_L4_CONN; /* connection in progress */
 	conn->flags |= CO_FL_ADDR_TO_SET;
 
-	fdtab[fd].iocb = conn_fd_handler;
-	fd_insert(fd);
+	/* Prepare to send a few handshakes related to the on-wire protocol. */
+	if (conn->send_proxy_ofs)
+		conn->flags |= CO_FL_SEND_PROXY;
+
+	conn_ctrl_init(conn);       /* registers the FD */
+	fdtab[fd].linger_risk = 1;  /* close hard if needed */
 	conn_sock_want_send(conn);  /* for connect status */
 
 	if (conn_xprt_init(conn) < 0) {
-		fd_delete(fd);
+		conn_force_close(conn);
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_RESOURCE;
 	}
 
@@ -513,32 +560,99 @@ int tcp_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 		return getsockname(fd, sa, &salen);
 }
 
+/* Tries to drain any pending incoming data from the socket to reach the
+ * receive shutdown. Returns positive if the shutdown was found, negative
+ * if EAGAIN was hit, otherwise zero. This is useful to decide whether we
+ * can close a connection cleanly are we must kill it hard.
+ */
+int tcp_drain(int fd)
+{
+	int turns = 2;
+	int len;
+
+	while (turns) {
+#ifdef MSG_TRUNC_CLEARS_INPUT
+		len = recv(fd, NULL, INT_MAX, MSG_DONTWAIT | MSG_NOSIGNAL | MSG_TRUNC);
+		if (len == -1 && errno == EFAULT)
+#endif
+			len = recv(fd, trash.str, trash.size, MSG_DONTWAIT | MSG_NOSIGNAL);
+
+		if (len == 0) {
+			/* cool, shutdown received */
+			fdtab[fd].linger_risk = 0;
+			return 1;
+		}
+
+		if (len < 0) {
+			if (errno == EAGAIN) {
+				/* connection not closed yet */
+				fd_cant_recv(fd);
+				return -1;
+			}
+			if (errno == EINTR)  /* oops, try again */
+				continue;
+			/* other errors indicate a dead connection, fine. */
+			fdtab[fd].linger_risk = 0;
+			return 1;
+		}
+		/* OK we read some data, let's try again once */
+		turns--;
+	}
+	/* some data are still present, give up */
+	return 0;
+}
+
 /* This is the callback which is set when a connection establishment is pending
- * and we have nothing to send, or if we have an init function we want to call
- * once the connection is established. It updates the FD polling status. It
- * returns 0 if it fails in a fatal way or needs to poll to go further, otherwise
- * it returns non-zero and removes itself from the connection's flags (the bit is
- * provided in <flag> by the caller).
+ * and we have nothing to send. It updates the FD polling status. It returns 0
+ * if it fails in a fatal way or needs to poll to go further, otherwise it
+ * returns non-zero and removes the CO_FL_WAIT_L4_CONN flag from the connection's
+ * flags. In case of error, it sets CO_FL_ERROR and leaves the error code in
+ * errno. The error checking is done in two passes in order to limit the number
+ * of syscalls in the normal case :
+ *   - if POLL_ERR was reported by the poller, we check for a pending error on
+ *     the socket before proceeding. If found, it's assigned to errno so that
+ *     upper layers can see it.
+ *   - otherwise connect() is used to check the connection state again, since
+ *     the getsockopt return cannot reliably be used to know if the connection
+ *     is still pending or ready. This one may often return an error as well,
+ *     since we don't always have POLL_ERR (eg: OSX or cached events).
  */
 int tcp_connect_probe(struct connection *conn)
 {
 	int fd = conn->t.sock.fd;
+	socklen_t lskerr;
+	int skerr;
 
 	if (conn->flags & CO_FL_ERROR)
+		return 0;
+
+	if (!conn_ctrl_ready(conn))
 		return 0;
 
 	if (!(conn->flags & CO_FL_WAIT_L4_CONN))
 		return 1; /* strange we were called while ready */
 
-	/* stop here if we reached the end of data */
-	if ((fdtab[fd].ev & (FD_POLL_IN|FD_POLL_HUP)) == FD_POLL_HUP)
-		goto out_error;
+	if (!fd_send_ready(fd))
+		return 0;
 
-	/* We have no data to send to check the connection, and
-	 * getsockopt() will not inform us whether the connection
-	 * is still pending. So we'll reuse connect() to check the
-	 * state of the socket. This has the advantage of giving us
-	 * the following info :
+	/* we might be the first witness of FD_POLL_ERR. Note that FD_POLL_HUP
+	 * without FD_POLL_IN also indicates a hangup without input data meaning
+	 * there was no connection.
+	 */
+	if (fdtab[fd].ev & FD_POLL_ERR ||
+	    (fdtab[fd].ev & (FD_POLL_IN|FD_POLL_HUP)) == FD_POLL_HUP) {
+		skerr = 0;
+		lskerr = sizeof(skerr);
+		getsockopt(fd, SOL_SOCKET, SO_ERROR, &skerr, &lskerr);
+		errno = skerr;
+		if (errno == EAGAIN)
+			errno = 0;
+		if (errno)
+			goto out_error;
+	}
+
+	/* Use connect() to check the state of the socket. This has the
+	 * advantage of giving us the following info :
 	 *  - error
 	 *  - connecting (EALREADY, EINPROGRESS)
 	 *  - connected (EISCONN, 0)
@@ -546,7 +660,7 @@ int tcp_connect_probe(struct connection *conn)
 	if (connect(fd, (struct sockaddr *)&conn->addr.to, get_addr_len(&conn->addr.to)) < 0) {
 		if (errno == EALREADY || errno == EINPROGRESS) {
 			__conn_sock_stop_recv(conn);
-			__conn_sock_poll_send(conn);
+			fd_cant_send(fd);
 			return 0;
 		}
 
@@ -567,8 +681,8 @@ int tcp_connect_probe(struct connection *conn)
 	/* Write error on the file descriptor. Report it to the connection
 	 * and disable polling on this FD.
 	 */
-
-	conn->flags |= CO_FL_ERROR;
+	fdtab[fd].linger_risk = 0;
+	conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
 	__conn_sock_stop_both(conn);
 	return 0;
 }
@@ -866,15 +980,15 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 		partial = 0;
 
 	list_for_each_entry(rule, &s->be->tcp_req.inspect_rules, list) {
-		int ret = ACL_PAT_PASS;
+		enum acl_test_res ret = ACL_TEST_PASS;
 
 		if (rule->cond) {
 			ret = acl_exec_cond(rule->cond, s->be, s, &s->txn, SMP_OPT_DIR_REQ | partial);
-			if (ret == ACL_PAT_MISS) {
+			if (ret == ACL_TEST_MISS) {
 				channel_dont_connect(req);
 				/* just set the request timeout once at the beginning of the request */
 				if (!tick_isset(req->analyse_exp) && s->be->tcp_req.inspect_delay)
-					req->analyse_exp = tick_add_ifset(now_ms, s->be->tcp_req.inspect_delay);
+					req->analyse_exp = tick_add(now_ms, s->be->tcp_req.inspect_delay);
 				return 0;
 			}
 
@@ -901,26 +1015,23 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 					s->flags |= SN_FINST_R;
 				return 0;
 			}
-			else if ((rule->action == TCP_ACT_TRK_SC1 && !s->stkctr[0].entry) ||
-			         (rule->action == TCP_ACT_TRK_SC2 && !s->stkctr[1].entry)) {
+			else if (rule->action >= TCP_ACT_TRK_SC0 && rule->action <= TCP_ACT_TRK_SCMAX) {
 				/* Note: only the first valid tracking parameter of each
 				 * applies.
 				 */
 				struct stktable_key *key;
 
+				if (stkctr_entry(&s->stkctr[tcp_trk_idx(rule->action)]))
+					continue;
+
 				t = rule->act_prm.trk_ctr.table.t;
 				key = stktable_fetch_key(t, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->act_prm.trk_ctr.expr);
 
 				if (key && (ts = stktable_get_entry(t, key))) {
-					if (rule->action == TCP_ACT_TRK_SC1) {
-						session_track_stkctr(&s->stkctr[0], t, ts);
-						if (s->fe != s->be)
-							s->flags |= SN_BE_TRACK_SC1;
-					} else {
-						session_track_stkctr(&s->stkctr[1], t, ts);
-						if (s->fe != s->be)
-							s->flags |= SN_BE_TRACK_SC2;
-					}
+					session_track_stkctr(&s->stkctr[tcp_trk_idx(rule->action)], t, ts);
+					stkctr_set_flags(&s->stkctr[tcp_trk_idx(rule->action)], STKCTR_TRACK_CONTENT);
+					if (s->fe != s->be)
+						stkctr_set_flags(&s->stkctr[tcp_trk_idx(rule->action)], STKCTR_TRACK_BACKEND);
 				}
 			}
 			else {
@@ -974,14 +1085,14 @@ int tcp_inspect_response(struct session *s, struct channel *rep, int an_bit)
 		partial = 0;
 
 	list_for_each_entry(rule, &s->be->tcp_rep.inspect_rules, list) {
-		int ret = ACL_PAT_PASS;
+		enum acl_test_res ret = ACL_TEST_PASS;
 
 		if (rule->cond) {
 			ret = acl_exec_cond(rule->cond, s->be, s, &s->txn, SMP_OPT_DIR_RES | partial);
-			if (ret == ACL_PAT_MISS) {
+			if (ret == ACL_TEST_MISS) {
 				/* just set the analyser timeout once at the beginning of the response */
 				if (!tick_isset(rep->analyse_exp) && s->be->tcp_rep.inspect_delay)
-					rep->analyse_exp = tick_add_ifset(now_ms, s->be->tcp_rep.inspect_delay);
+					rep->analyse_exp = tick_add(now_ms, s->be->tcp_rep.inspect_delay);
 				return 0;
 			}
 
@@ -1008,6 +1119,12 @@ int tcp_inspect_response(struct session *s, struct channel *rep, int an_bit)
 					s->flags |= SN_FINST_D;
 				return 0;
 			}
+			else if (rule->action == TCP_ACT_CLOSE) {
+				rep->prod->flags |= SI_FL_NOLINGER | SI_FL_NOHALF;
+				si_shutr(rep->prod);
+				si_shutw(rep->prod);
+				break;
+			}
 			else {
 				/* otherwise accept */
 				break;
@@ -1027,18 +1144,22 @@ int tcp_inspect_response(struct session *s, struct channel *rep, int an_bit)
 /* This function performs the TCP layer4 analysis on the current request. It
  * returns 0 if a reject rule matches, otherwise 1 if either an accept rule
  * matches or if no more rule matches. It can only use rules which don't need
- * any data.
+ * any data. This only works on connection-based client-facing stream interfaces.
  */
 int tcp_exec_req_rules(struct session *s)
 {
 	struct tcp_rule *rule;
 	struct stksess *ts;
 	struct stktable *t = NULL;
+	struct connection *conn = objt_conn(s->si[0].end);
 	int result = 1;
-	int ret;
+	enum acl_test_res ret;
+
+	if (!conn)
+		return result;
 
 	list_for_each_entry(rule, &s->fe->tcp_req.l4_rules, list) {
-		ret = ACL_PAT_PASS;
+		ret = ACL_TEST_PASS;
 
 		if (rule->cond) {
 			ret = acl_exec_cond(rule->cond, s->fe, s, NULL, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
@@ -1061,22 +1182,24 @@ int tcp_exec_req_rules(struct session *s)
 				result = 0;
 				break;
 			}
-			else if ((rule->action == TCP_ACT_TRK_SC1 && !s->stkctr[0].entry) ||
-			         (rule->action == TCP_ACT_TRK_SC2 && !s->stkctr[1].entry)) {
+			else if (rule->action >= TCP_ACT_TRK_SC0 && rule->action <= TCP_ACT_TRK_SCMAX) {
 				/* Note: only the first valid tracking parameter of each
 				 * applies.
 				 */
 				struct stktable_key *key;
 
+				if (stkctr_entry(&s->stkctr[tcp_trk_idx(rule->action)]))
+					continue;
+
 				t = rule->act_prm.trk_ctr.table.t;
 				key = stktable_fetch_key(t, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->act_prm.trk_ctr.expr);
 
-				if (key && (ts = stktable_get_entry(t, key))) {
-					if (rule->action == TCP_ACT_TRK_SC1)
-						session_track_stkctr(&s->stkctr[0], t, ts);
-					else
-						session_track_stkctr(&s->stkctr[1], t, ts);
-				}
+				if (key && (ts = stktable_get_entry(t, key)))
+					session_track_stkctr(&s->stkctr[tcp_trk_idx(rule->action)], t, ts);
+			}
+			else if (rule->action == TCP_ACT_EXPECT_PX) {
+				conn->flags |= CO_FL_ACCEPT_PROXY;
+				conn_sock_want_recv(conn);
 			}
 			else {
 				/* otherwise it's an accept */
@@ -1107,9 +1230,13 @@ static int tcp_parse_response_rule(char **args, int arg, int section_type,
 		arg++;
 		rule->action = TCP_ACT_REJECT;
 	}
+	else if (strcmp(args[arg], "close") == 0) {
+		arg++;
+		rule->action = TCP_ACT_CLOSE;
+	}
 	else {
 		memprintf(err,
-		          "'%s %s' expects 'accept' or 'reject' in %s '%s' (got '%s')",
+		          "'%s %s' expects 'accept', 'close' or 'reject' in %s '%s' (got '%s')",
 		          args[0], args[1], proxy_type_str(curpx), curpx->id, args[arg]);
 		return -1;
 	}
@@ -1153,18 +1280,20 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 		arg++;
 		rule->action = TCP_ACT_REJECT;
 	}
-	else if (strcmp(args[arg], "track-sc1") == 0 || strcmp(args[arg], "track-sc2") == 0) {
+	else if (strncmp(args[arg], "track-sc", 8) == 0 &&
+		 args[arg][9] == '\0' && args[arg][8] >= '0' &&
+		 args[arg][8] <= '0' + MAX_SESS_STKCTR) { /* track-sc 0..9 */
 		struct sample_expr *expr;
 		int kw = arg;
 
 		arg++;
 
 		curpx->conf.args.ctx = ARGC_TRK;
-		expr = sample_parse_expr(args, &arg, trash.str, trash.size, &curpx->conf.args);
+		expr = sample_parse_expr(args, &arg, err, &curpx->conf.args);
 		if (!expr) {
 			memprintf(err,
 			          "'%s %s %s' : %s",
-			          args[0], args[1], args[kw], trash.str);
+			          args[0], args[1], args[kw], *err);
 			return -1;
 		}
 
@@ -1193,17 +1322,31 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 			arg++;
 		}
 		rule->act_prm.trk_ctr.expr = expr;
+		rule->action = TCP_ACT_TRK_SC0 + args[kw][8] - '0';
+	}
+	else if (strcmp(args[arg], "expect-proxy") == 0) {
+		if (strcmp(args[arg+1], "layer4") != 0) {
+			memprintf(err,
+				  "'%s %s %s' only supports 'layer4' in %s '%s' (got '%s')",
+				  args[0], args[1], args[arg], proxy_type_str(curpx), curpx->id, args[arg+1]);
+			return -1;
+		}
 
-		if (args[kw][8] == '1')
-			rule->action = TCP_ACT_TRK_SC1;
-		else
-			rule->action = TCP_ACT_TRK_SC2;
+		if (!(where & SMP_VAL_FE_CON_ACC)) {
+			memprintf(err,
+				  "'%s %s' is not allowed in '%s %s' rules in %s '%s'",
+				  args[arg], args[arg+1], args[0], args[1], proxy_type_str(curpx), curpx->id);
+			return -1;
+		}
+
+		arg += 2;
+		rule->action = TCP_ACT_EXPECT_PX;
 	}
 	else {
 		memprintf(err,
-		          "'%s %s' expects 'accept', 'reject', 'track-sc1' "
-		          "or 'track-sc2' in %s '%s' (got '%s')",
-		          args[0], args[1], proxy_type_str(curpx), curpx->id, args[arg]);
+		          "'%s %s' expects 'accept', 'reject', 'track-sc0' ... 'track-sc%d' "
+		          " in %s '%s' (got '%s')",
+		          args[0], args[1], MAX_SESS_STKCTR, proxy_type_str(curpx), curpx->id, args[arg]);
 		return -1;
 	}
 
@@ -1494,15 +1637,20 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 /* fetch the connection's source IPv4/IPv6 address */
 static int
 smp_fetch_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-              const struct arg *args, struct sample *smp)
+              const struct arg *args, struct sample *smp, const char *kw)
 {
-	switch (l4->si[0].conn->addr.from.ss_family) {
+	struct connection *cli_conn = objt_conn(l4->si[0].end);
+
+	if (!cli_conn)
+		return 0;
+
+	switch (cli_conn->addr.from.ss_family) {
 	case AF_INET:
-		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn->addr.from)->sin_addr;
+		smp->data.ipv4 = ((struct sockaddr_in *)&cli_conn->addr.from)->sin_addr;
 		smp->type = SMP_T_IPV4;
 		break;
 	case AF_INET6:
-		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn->addr.from))->sin6_addr;
+		smp->data.ipv6 = ((struct sockaddr_in6 *)&cli_conn->addr.from)->sin6_addr;
 		smp->type = SMP_T_IPV6;
 		break;
 	default:
@@ -1516,10 +1664,15 @@ smp_fetch_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 /* set temp integer to the connection's source port */
 static int
 smp_fetch_sport(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
+	struct connection *cli_conn = objt_conn(l4->si[0].end);
+
+	if (!cli_conn)
+		return 0;
+
 	smp->type = SMP_T_UINT;
-	if (!(smp->data.uint = get_host_port(&l4->si[0].conn->addr.from)))
+	if (!(smp->data.uint = get_host_port(&cli_conn->addr.from)))
 		return 0;
 
 	smp->flags = 0;
@@ -1529,17 +1682,22 @@ smp_fetch_sport(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 /* fetch the connection's destination IPv4/IPv6 address */
 static int
 smp_fetch_dst(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-              const struct arg *args, struct sample *smp)
+              const struct arg *args, struct sample *smp, const char *kw)
 {
-	conn_get_to_addr(l4->si[0].conn);
+	struct connection *cli_conn = objt_conn(l4->si[0].end);
 
-	switch (l4->si[0].conn->addr.to.ss_family) {
+	if (!cli_conn)
+		return 0;
+
+	conn_get_to_addr(cli_conn);
+
+	switch (cli_conn->addr.to.ss_family) {
 	case AF_INET:
-		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn->addr.to)->sin_addr;
+		smp->data.ipv4 = ((struct sockaddr_in *)&cli_conn->addr.to)->sin_addr;
 		smp->type = SMP_T_IPV4;
 		break;
 	case AF_INET6:
-		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn->addr.to))->sin6_addr;
+		smp->data.ipv6 = ((struct sockaddr_in6 *)&cli_conn->addr.to)->sin6_addr;
 		smp->type = SMP_T_IPV6;
 		break;
 	default:
@@ -1553,12 +1711,17 @@ smp_fetch_dst(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 /* set temp integer to the frontend connexion's destination port */
 static int
 smp_fetch_dport(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
-	conn_get_to_addr(l4->si[0].conn);
+	struct connection *cli_conn = objt_conn(l4->si[0].end);
+
+	if (!cli_conn)
+		return 0;
+
+	conn_get_to_addr(cli_conn);
 
 	smp->type = SMP_T_UINT;
-	if (!(smp->data.uint = get_host_port(&l4->si[0].conn->addr.to)))
+	if (!(smp->data.uint = get_host_port(&cli_conn->addr.to)))
 		return 0;
 
 	smp->flags = 0;
@@ -1686,7 +1849,7 @@ static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, stru
 }
 #endif
 
-static struct cfg_kw_list cfg_kws = {{ },{
+static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "tcp-request",  tcp_parse_tcp_req },
 	{ CFG_LISTEN, "tcp-response", tcp_parse_tcp_rep },
 	{ 0, NULL, NULL },
@@ -1696,11 +1859,7 @@ static struct cfg_kw_list cfg_kws = {{ },{
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct acl_kw_list acl_kws = {{ },{
-	{ "dst",      NULL, acl_parse_ip,  acl_match_ip  },
-	{ "dst_port", NULL, acl_parse_int, acl_match_int },
-	{ "src",      NULL, acl_parse_ip,  acl_match_ip  },
-	{ "src_port", NULL, acl_parse_int, acl_match_int },
+static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 
@@ -1710,7 +1869,7 @@ static struct acl_kw_list acl_kws = {{ },{
  * common denominator, the type that can be casted into all other ones. For
  * instance v4/v6 must be declared v4.
  */
-static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
+static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "dst",      smp_fetch_dst,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
 	{ "dst_port", smp_fetch_dport, 0, NULL, SMP_T_UINT, SMP_USE_L4CLI },
 	{ "src",      smp_fetch_src,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },

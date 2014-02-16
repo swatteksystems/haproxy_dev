@@ -63,7 +63,6 @@ extern char *get_http_auth_buff;
 #define HTTP_IS_TOKEN(x) (http_is_token[(unsigned char)(x)])
 #define HTTP_IS_VER_TOKEN(x) (http_is_ver_token[(unsigned char)(x)])
 
-int event_accept(int fd);
 int process_cli(struct session *t);
 int process_srv_data(struct session *t);
 int process_srv_conn(struct session *t);
@@ -90,15 +89,22 @@ void manage_server_side_cookies(struct session *t, struct channel *rtr);
 void check_response_for_cacheability(struct session *t, struct channel *rtr);
 int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct proxy *backend);
 void init_proto_http();
+int http_find_full_header2(const char *name, int len,
+                           char *sol, struct hdr_idx *idx,
+                           struct hdr_ctx *ctx);
 int http_find_header2(const char *name, int len,
 		      char *sol, struct hdr_idx *idx,
 		      struct hdr_ctx *ctx);
+char *find_hdr_value_end(char *s, const char *e);
+int http_header_match2(const char *hdr, const char *end, const char *name, int len);
+int http_remove_header2(struct http_msg *msg, struct hdr_idx *idx, struct hdr_ctx *ctx);
+int http_header_add_tail2(struct http_msg *msg, struct hdr_idx *hdr_idx, const char *text, int len);
 void http_sess_log(struct session *s);
 void http_perform_server_redirect(struct session *s, struct stream_interface *si);
 void http_return_srv_error(struct session *s, struct stream_interface *si);
 void http_capture_bad_message(struct error_snapshot *es, struct session *s,
                               struct http_msg *msg,
-			      int state, struct proxy *other_end);
+			      enum ht_state state, struct proxy *other_end);
 unsigned int http_get_hdr(const struct http_msg *msg, const char *hname, int hlen,
 			  struct hdr_idx *idx, int occ,
 			  struct hdr_ctx *ctx, char **vptr, int *vlen);
@@ -108,10 +114,11 @@ void http_end_txn(struct session *s);
 void http_reset_txn(struct session *s);
 
 struct http_req_rule *parse_http_req_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
+struct http_res_rule *parse_http_res_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
 void free_http_req_rules(struct list *r);
 struct chunk *http_error_message(struct session *s, int msgnum);
-struct redirect_rule *http_parse_redirect_rule(const char *file, int line, struct proxy *curproxy,
-                                               const char **args, char **errmsg);
+struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, struct proxy *curproxy,
+                                               const char **args, char **errmsg, int use_fmt);
 
 /* to be used when contents change in an HTTP message */
 #define http_msg_move_end(msg, bytes) do { \

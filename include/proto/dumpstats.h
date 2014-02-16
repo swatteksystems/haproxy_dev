@@ -38,21 +38,14 @@
 #define STATS_TYPE_SV  2
 #define STATS_TYPE_SO  3
 
-/* unix stats socket states */
-#define STAT_CLI_INIT   0   /* initial state */
-#define STAT_CLI_END    1   /* final state, let's close */
-#define STAT_CLI_GETREQ 2   /* wait for a request */
-#define STAT_CLI_OUTPUT 3   /* all states after this one are responses */
-#define STAT_CLI_PROMPT 3   /* display the prompt (first output, same code) */
-#define STAT_CLI_PRINT  4   /* display message in cli->msg */
-
-#define STAT_CLI_O_INFO 5   /* dump info */
-#define STAT_CLI_O_SESS 6   /* dump sessions */
-#define STAT_CLI_O_ERR  7   /* dump errors */
-#define STAT_CLI_O_TAB  8   /* dump tables */
-#define STAT_CLI_O_CLR  9   /* clear tables */
-#define STAT_CLI_O_SET  10  /* set entries in tables */
-#define STAT_CLI_O_STAT 11  /* dump stats */
+/* HTTP stats : applet.st0 */
+enum {
+	STAT_HTTP_DONE = 0,  /* finished */
+	STAT_HTTP_HEAD,      /* send headers before dump */
+	STAT_HTTP_DUMP,      /* dumping stats */
+	STAT_HTTP_POST,      /* waiting post data */
+	STAT_HTTP_LAST,      /* sending last chunk of response */
+};
 
 /* HTML form to limit output scope */
 #define STAT_SCOPE_TXT_MAXLEN 20      /* max len for scope substring */

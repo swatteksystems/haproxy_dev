@@ -22,7 +22,7 @@ static struct srv_kw_list srv_keywords = {
 	.list = LIST_HEAD_INIT(srv_keywords.list)
 };
 
-int srv_downtime(struct server *s)
+int srv_downtime(const struct server *s)
 {
 	if ((s->state & SRV_RUNNING) && s->last_change < now.tv_sec)		// ignore negative time
 		return s->down_time;
@@ -30,15 +30,17 @@ int srv_downtime(struct server *s)
 	return now.tv_sec - s->last_change + s->down_time;
 }
 
-int srv_getinter(struct server *s)
+int srv_getinter(const struct check *check)
 {
-	if ((s->state & SRV_CHECKED) && (s->health == s->rise + s->fall - 1))
-		return s->inter;
+	const struct server *s = check->server;
 
-	if (!(s->state & SRV_RUNNING) && s->health==0)
-		return (s->downinter)?(s->downinter):(s->inter);
+	if ((check->state & CHK_ST_CONFIGURED) && (check->health == check->rise + check->fall - 1))
+		return check->inter;
 
-	return (s->fastinter)?(s->fastinter):(s->inter);
+	if (!(s->state & SRV_RUNNING) && check->health == 0)
+		return (check->downinter)?(check->downinter):(check->inter);
+
+	return (check->fastinter)?(check->fastinter):(check->inter);
 }
 
 /*
@@ -156,6 +158,43 @@ static void __listener_init(void)
 	srv_register_keywords(&srv_kws);
 }
 
+/* Recomputes the server's eweight based on its state, uweight, the current time,
+ * and the proxy's algorihtm. To be used after updating sv->uweight. The warmup
+ * state is automatically disabled if the time is elapsed.
+ */
+void server_recalc_eweight(struct server *sv)
+{
+	struct proxy *px = sv->proxy;
+	unsigned w;
+
+	if (now.tv_sec < sv->last_change || now.tv_sec >= sv->last_change + sv->slowstart) {
+		/* go to full throttle if the slowstart interval is reached */
+		sv->state &= ~SRV_WARMINGUP;
+	}
+
+	/* We must take care of not pushing the server to full throttle during slow starts.
+	 * It must also start immediately, at least at the minimal step when leaving maintenance.
+	 */
+	if ((sv->state & SRV_WARMINGUP) && (px->lbprm.algo & BE_LB_PROP_DYN))
+		w = (px->lbprm.wdiv * (now.tv_sec - sv->last_change) + sv->slowstart) / sv->slowstart;
+	else
+		w = px->lbprm.wdiv;
+
+	sv->eweight = (sv->uweight * w + px->lbprm.wmult - 1) / px->lbprm.wmult;
+
+	/* now propagate the status change to any LB algorithms */
+	if (px->lbprm.update_server_eweight)
+		px->lbprm.update_server_eweight(sv);
+	else if (sv->eweight) {
+		if (px->lbprm.set_server_status_up)
+			px->lbprm.set_server_status_up(sv);
+	}
+	else {
+		if (px->lbprm.set_server_status_down)
+			px->lbprm.set_server_status_down(sv);
+	}
+}
+
 /*
  * Parses weight_str and configures sv accordingly.
  * Returns NULL on success, error message string otherwise.
@@ -197,29 +236,7 @@ const char *server_parse_weight_change_request(struct server *sv,
 		return "Backend is using a static LB algorithm and only accepts weights '0%' and '100%'.\n";
 
 	sv->uweight = w;
-
-	if (px->lbprm.algo & BE_LB_PROP_DYN) {
-	/* we must take care of not pushing the server to full throttle during slow starts */
-		if ((sv->state & SRV_WARMINGUP))
-			sv->eweight = (BE_WEIGHT_SCALE * (now.tv_sec - sv->last_change) + sv->slowstart - 1) / sv->slowstart;
-		else
-			sv->eweight = BE_WEIGHT_SCALE;
-		sv->eweight *= sv->uweight;
-	} else {
-		sv->eweight = sv->uweight;
-	}
-
-	/* static LB algorithms are a bit harder to update */
-	if (px->lbprm.update_server_eweight)
-		px->lbprm.update_server_eweight(sv);
-	else if (sv->eweight) {
-		if (px->lbprm.set_server_status_up)
-			px->lbprm.set_server_status_up(sv);
-	}
-	else {
-		if (px->lbprm.set_server_status_down)
-			px->lbprm.set_server_status_down(sv);
-	}
+	server_recalc_eweight(sv);
 
 	return NULL;
 }

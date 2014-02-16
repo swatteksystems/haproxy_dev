@@ -2,7 +2,7 @@
  * include/types/connection.h
  * This file describes the connection struct and associated constants.
  *
- * Copyright (C) 2000-2012 Willy Tarreau - w@1wt.eu
+ * Copyright (C) 2000-2014 Willy Tarreau - w@1wt.eu
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -37,34 +37,17 @@ struct connection;
 struct buffer;
 struct pipe;
 
-/* Polling flags that are manipulated by I/O callbacks and handshake callbacks
- * indicate what they expect from a file descriptor at each layer. For each
- * direction, we have 2 bits, one stating whether any suspected activity on the
- * FD induce a call to the iocb, and another one indicating that the FD has
- * already returned EAGAIN and that polling on it is essential before calling
- * the iocb again :
- *   POL ENA  state
- *    0   0   STOPPED : any activity on this FD is ignored
- *    0   1   ENABLED : any (suspected) activity may call the iocb
- *    1   0   STOPPED : as above
- *    1   1   POLLED  : the FD is being polled for activity
+/* For each direction, we have a CO_FL_{SOCK,DATA}_<DIR>_ENA flag, which
+ * indicates if read or write is desired in that direction for the respective
+ * layers. The current status corresponding to the current layer being used is
+ * remembered in the CO_FL_CURR_<DIR>_ENA flag. The need to poll (ie receipt of
+ * EAGAIN) is remembered at the file descriptor level so that even when the
+ * activity is stopped and restarted, we still remember whether it was needed
+ * to poll before attempting the I/O.
  *
- * - Enabling an I/O event consists in ORing with 1.
- * - Stopping an I/O event consists in ANDing with ~1.
- * - Polling for an I/O event consists in ORing with ~3.
- *
- * The last ENA state is remembered in CO_FL_CURR_* so that differential
- * changes can be applied. After bits are applied, the POLL status bits are
- * cleared so that it is possible to detect when an EAGAIN was encountered. For
- * pollers that do not support speculative I/O, POLLED is the same as ENABLED
- * and the POL flag can safely be ignored. However it makes a difference for
- * the connection handler.
- *
- * The ENA flags are per-layer (one pair for SOCK, another one for DATA). The
- * POL flags are irrelevant to these layers and only reflect the fact that
- * EAGAIN was encountered, they're materialised by the CO_FL_WAIT_* connection
- * flags. POL flags always indicate a polling change because it is assumed that
- * the poller uses a cache and does not always poll.
+ * The CO_FL_CURR_<DIR>_ENA flag is set from the FD status in
+ * conn_refresh_polling_flags(). The FD state is updated according to these
+ * flags in conn_cond_update_polling().
  */
 
 /* flags for use in connection->flags */
@@ -75,12 +58,16 @@ enum {
 	CO_FL_SOCK_RD_ENA   = 0x00000001,  /* receiving handshakes is allowed */
 	CO_FL_DATA_RD_ENA   = 0x00000002,  /* receiving data is allowed */
 	CO_FL_CURR_RD_ENA   = 0x00000004,  /* receiving is currently allowed */
-	CO_FL_WAIT_RD       = 0x00000008,  /* receiving needs to poll first */
+	/* unused : 0x00000008 */
 
 	CO_FL_SOCK_WR_ENA   = 0x00000010,  /* sending handshakes is desired */
 	CO_FL_DATA_WR_ENA   = 0x00000020,  /* sending data is desired */
 	CO_FL_CURR_WR_ENA   = 0x00000040,  /* sending is currently desired */
-	CO_FL_WAIT_WR       = 0x00000080,  /* sending needs to poll first */
+	/* unused : 0x00000080 */
+
+	/* These flags indicate whether the Control and Transport layers are initialized */
+	CO_FL_CTRL_READY    = 0x00000100, /* FD was registered, fd_delete() needed */
+	CO_FL_XPRT_READY    = 0x00000200, /* xprt_init() done, xprt_close() needed */
 
 	/* These flags are used by data layers to indicate they had to stop
 	 * sending data because a buffer was empty (WAIT_DATA) or stop receiving
@@ -117,13 +104,13 @@ enum {
 	 * handshake should be added after this point, and CO_FL_HANDSHAKE
 	 * should be updated.
 	 */
-	CO_FL_SI_SEND_PROXY = 0x01000000,  /* send a valid PROXY protocol header */
+	CO_FL_SEND_PROXY    = 0x01000000,  /* send a valid PROXY protocol header */
 	CO_FL_SSL_WAIT_HS   = 0x02000000,  /* wait for an SSL handshake to complete */
 	CO_FL_ACCEPT_PROXY  = 0x04000000,  /* receive a valid PROXY protocol header */
-	CO_FL_LOCAL_SPROXY  = 0x08000000,  /* send a valid local PROXY protocol header */
+	/* unused : 0x08000000 */
 
 	/* below we have all handshake flags grouped into one */
-	CO_FL_HANDSHAKE     = CO_FL_SI_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY | CO_FL_LOCAL_SPROXY,
+	CO_FL_HANDSHAKE     = CO_FL_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY,
 
 	/* when any of these flags is set, polling is defined by socket-layer
 	 * operations, as opposed to data-layer. Transport is explicitly not
@@ -131,6 +118,8 @@ enum {
 	 * as DATA or SOCK on some implementations.
 	 */
 	CO_FL_POLL_SOCK     = CO_FL_HANDSHAKE | CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN,
+
+	/* unused : 0x10000000, 0x20000000, 0x40000000 */
 
 	/* This last flag indicates that the transport layer is used (for instance
 	 * by logs) and must not be cleared yet. The last call to conn_xprt_close()
@@ -143,6 +132,19 @@ enum {
 /* possible connection error codes */
 enum {
 	CO_ER_NONE,             /* no error */
+
+	CO_ER_CONF_FDLIM,       /* reached process' configured FD limitation */
+	CO_ER_PROC_FDLIM,       /* reached process' FD limitation */
+	CO_ER_SYS_FDLIM,        /* reached system's FD limitation */
+	CO_ER_SYS_MEMLIM,       /* reached system buffers limitation */
+	CO_ER_NOPROTO,          /* protocol not supported */
+	CO_ER_SOCK_ERR,         /* other socket error */
+
+	CO_ER_PORT_RANGE,       /* source port range exhausted */
+	CO_ER_CANT_BIND,        /* can't bind to source address */
+	CO_ER_FREE_PORTS,       /* no more free ports on the system */
+	CO_ER_ADDR_INUSE,       /* local address already in use */
+
 	CO_ER_PRX_EMPTY,        /* nothing received in PROXY protocol header */
 	CO_ER_PRX_ABORT,        /* client abort during PROXY protocol header */
 	CO_ER_PRX_TIMEOUT,      /* timeout while waiting for a PROXY header */
@@ -230,24 +232,27 @@ struct conn_src {
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
  * socket, and can also be made to an internal applet. It can support
- * several transport schemes (applet, raw, ssl, ...). It can support several
+ * several transport schemes (raw, ssl, ...). It can support several
  * connection control schemes, generally a protocol for socket-oriented
  * connections, but other methods for applets.
  */
 struct connection {
+	enum obj_type obj_type;       /* differentiates connection from applet context */
+	unsigned char err_code;       /* CO_ER_* */
+	signed short send_proxy_ofs;  /* <0 = offset to (re)send from the end, >0 = send all */
+	unsigned int flags;           /* CO_FL_* */
 	const struct protocol *ctrl;  /* operations at the socket layer */
 	const struct xprt_ops *xprt;  /* operations at the transport layer */
-	const struct data_cb  *data;  /* data layer callbacks */
-	unsigned int flags;           /* CO_FL_* */
-	int xprt_st;                  /* transport layer state, initialized to zero */
+	const struct data_cb  *data;  /* data layer callbacks. Must be set before xprt->init() */
 	void *xprt_ctx;               /* general purpose pointer, initialized to NULL */
 	void *owner;                  /* pointer to upper layer's entity (eg: stream interface) */
+	int xprt_st;                  /* transport layer state, initialized to zero */
+
 	union {                       /* definitions which depend on connection type */
 		struct {              /*** information used by socket-based connections ***/
 			int fd;       /* file descriptor for a stream driver when known */
 		} sock;
 	} t;
-	unsigned int err_code;        /* CO_ER_* */
 	enum obj_type *target;        /* the target to connect to (server, proxy, applet, ...) */
 	struct {
 		struct sockaddr_storage from;	/* client address, or address to spoof when connecting to the server */

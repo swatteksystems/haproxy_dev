@@ -64,6 +64,12 @@
 #define ACCESS_LVL_OPER     2
 #define ACCESS_LVL_ADMIN    3
 
+/* SSL server verify mode */
+enum {
+	SSL_SERVER_VERIFY_NONE = 0,
+	SSL_SERVER_VERIFY_REQUIRED = 1,
+};
+
 /* FIXME : this will have to be redefined correctly */
 struct global {
 #ifdef USE_OPENSSL
@@ -79,10 +85,15 @@ struct global {
 	char *listen_default_ciphers;
 	char *connect_default_ciphers;
 #endif
+	unsigned int ssl_server_verify; /* default verify mode on servers side */
 	struct freq_ctr conn_per_sec;
+	struct freq_ctr sess_per_sec;
+	struct freq_ctr ssl_per_sec;
 	struct freq_ctr comp_bps_in;	/* bytes per second, before http compression */
 	struct freq_ctr comp_bps_out;	/* bytes per second, after http compression */
 	int cps_lim, cps_max;
+	int sps_lim, sps_max;
+	int ssl_lim, ssl_max;
 	int comp_rate_lim;           /* HTTP compression rate limit */
 	int maxpipes;		/* max # of pipes */
 	int maxsock;		/* max # of sockets */
@@ -90,7 +101,7 @@ struct global {
 	int rlimit_memmax;	/* default ulimit-d in megs value : 0=unset */
 	long maxzlibmem;        /* max RAM for zlib in bytes */
 	int mode;
-	unsigned int req_count; /* HTTP request counter */
+	unsigned int req_count; /* request counter (HTTP or TCP session) for logs and unique_id */
 	int last_checks;
 	int spread_checks;
 	char *chroot;

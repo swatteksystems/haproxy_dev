@@ -10,9 +10,12 @@
  *
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include <common/accept4.h>
 #include <common/config.h>
@@ -256,19 +259,24 @@ void listener_accept(int fd)
 	int max_accept = l->maxaccept ? l->maxaccept : 1;
 	int cfd;
 	int ret;
+#ifdef USE_ACCEPT4
+	static int accept4_broken;
+#endif
 
 	if (unlikely(l->nbconn >= l->maxconn)) {
 		listener_full(l);
 		return;
 	}
 
-	if (global.cps_lim && !(l->options & LI_O_UNLIMITED)) {
-		int max = freq_ctr_remain(&global.conn_per_sec, global.cps_lim, 0);
+	if (!(l->options & LI_O_UNLIMITED) && global.sps_lim) {
+		int max = freq_ctr_remain(&global.sess_per_sec, global.sps_lim, 0);
+		int expire;
 
 		if (unlikely(!max)) {
 			/* frontend accept rate limit was reached */
 			limit_listener(l, &global_listener_queue);
-			task_schedule(global_listener_queue_task, tick_add(now_ms, next_event_delay(&global.conn_per_sec, global.cps_lim, 0)));
+			expire = tick_add(now_ms, next_event_delay(&global.sess_per_sec, global.sps_lim, 0));
+			task_schedule(global_listener_queue_task, tick_first(expire, global_listener_queue_task->expire));
 			return;
 		}
 
@@ -276,6 +284,38 @@ void listener_accept(int fd)
 			max_accept = max;
 	}
 
+	if (!(l->options & LI_O_UNLIMITED) && global.cps_lim) {
+		int max = freq_ctr_remain(&global.conn_per_sec, global.cps_lim, 0);
+		int expire;
+
+		if (unlikely(!max)) {
+			/* frontend accept rate limit was reached */
+			limit_listener(l, &global_listener_queue);
+			expire = tick_add(now_ms, next_event_delay(&global.conn_per_sec, global.cps_lim, 0));
+			task_schedule(global_listener_queue_task, tick_first(expire, global_listener_queue_task->expire));
+			return;
+		}
+
+		if (max_accept > max)
+			max_accept = max;
+	}
+#ifdef USE_OPENSSL
+	if (!(l->options & LI_O_UNLIMITED) && global.ssl_lim && l->bind_conf && l->bind_conf->is_ssl) {
+		int max = freq_ctr_remain(&global.ssl_per_sec, global.ssl_lim, 0);
+		int expire;
+
+		if (unlikely(!max)) {
+			/* frontend accept rate limit was reached */
+			limit_listener(l, &global_listener_queue);
+			expire = tick_add(now_ms, next_event_delay(&global.ssl_per_sec, global.ssl_lim, 0));
+			task_schedule(global_listener_queue_task, tick_first(expire, global_listener_queue_task->expire));
+			return;
+		}
+
+		if (max_accept > max)
+			max_accept = max;
+	}
+#endif
 	if (p && p->fe_sps_lim) {
 		int max = freq_ctr_remain(&p->fe_sess_per_sec, p->fe_sps_lim, 0);
 
@@ -311,22 +351,25 @@ void listener_accept(int fd)
 		}
 
 #ifdef USE_ACCEPT4
-		cfd = accept4(fd, (struct sockaddr *)&addr, &laddr, SOCK_NONBLOCK);
-		if (unlikely(cfd == -1 && errno == EINVAL)) {
-			/* unsupported syscall, fallback to normal accept()+fcntl() */
+		/* only call accept4() if it's known to be safe, otherwise
+		 * fallback to the legacy accept() + fcntl().
+		 */
+		if (unlikely(accept4_broken ||
+			((cfd = accept4(fd, (struct sockaddr *)&addr, &laddr, SOCK_NONBLOCK)) == -1 &&
+			(errno == ENOSYS || errno == EINVAL || errno == EBADF) &&
+			(accept4_broken = 1))))
+#endif
 			if ((cfd = accept(fd, (struct sockaddr *)&addr, &laddr)) != -1)
 				fcntl(cfd, F_SETFL, O_NONBLOCK);
-		}
-#else
-		cfd = accept(fd, (struct sockaddr *)&addr, &laddr);
-#endif
+
 		if (unlikely(cfd == -1)) {
 			switch (errno) {
 			case EAGAIN:
+				fd_cant_recv(fd);
+				return;   /* nothing more to accept */
 			case EINTR:
 			case ECONNABORTED:
-				fd_poll_recv(fd);
-				return;   /* nothing more to accept */
+				continue;
 			case ENFILE:
 				if (p)
 					send_log(p, LOG_EMERG,
@@ -353,9 +396,8 @@ void listener_accept(int fd)
 				task_schedule(global_listener_queue_task, tick_add(now_ms, 100)); /* try again in 100 ms */
 				return;
 			default:
-				/* unexpected result, let's go back to poll */
-				fd_poll_recv(fd);
-				return;
+				/* unexpected result, let's give up and let other tasks run */
+				goto stop;
 			}
 		}
 
@@ -410,9 +452,26 @@ void listener_accept(int fd)
 			return;
 		}
 
+		/* increase the per-process number of cumulated connections */
+		if (!(l->options & LI_O_UNLIMITED)) {
+			update_freq_ctr(&global.sess_per_sec, 1);
+			if (global.sess_per_sec.curr_ctr > global.sps_max)
+				global.sps_max = global.sess_per_sec.curr_ctr;
+		}
+#ifdef USE_OPENSSL
+		if (!(l->options & LI_O_UNLIMITED) && l->bind_conf && l->bind_conf->is_ssl) {
+
+			update_freq_ctr(&global.ssl_per_sec, 1);
+			if (global.ssl_per_sec.curr_ctr > global.ssl_max)
+				global.ssl_max = global.ssl_per_sec.curr_ctr;
+		}
+#endif
+
 	} /* end of while (max_accept--) */
 
 	/* we've exhausted max_accept, so there is no need to poll again */
+ stop:
+	fd_done_recv(fd);
 	return;
 }
 
@@ -488,7 +547,7 @@ void bind_dump_kws(char **out)
 /* set temp integer to the number of connexions to the same listening socket */
 static int
 smp_fetch_dconn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->type = SMP_T_UINT;
 	smp->data.uint = l4->listener->nbconn;
@@ -498,7 +557,7 @@ smp_fetch_dconn(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 /* set temp integer to the id of the socket (listener) */
 static int
 smp_fetch_so_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->type = SMP_T_UINT;
 	smp->data.uint = l4->listener->luid;
@@ -643,7 +702,7 @@ static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct bi
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct sample_fetch_kw_list smp_kws = {{ },{
+static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "dst_conn", smp_fetch_dconn, 0, NULL, SMP_T_UINT, SMP_USE_FTEND, },
 	{ "so_id",    smp_fetch_so_id, 0, NULL, SMP_T_UINT, SMP_USE_FTEND, },
 	{ /* END */ },
@@ -652,9 +711,7 @@ static struct sample_fetch_kw_list smp_kws = {{ },{
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct acl_kw_list acl_kws = {{ },{
-	{ "dst_conn",  NULL, acl_parse_int, acl_match_int },
-	{ "so_id",     NULL, acl_parse_int, acl_match_int },
+static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 

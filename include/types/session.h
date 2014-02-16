@@ -60,19 +60,20 @@
 #define SN_TUNNEL	0x00000800	/* tunnel-mode session, nothing to catch after data */
 
 /* session termination conditions, bits values 0x1000 to 0x7000 (0-9 shift 12) */
-#define SN_ERR_NONE     0x00000000
-#define SN_ERR_CLITO	0x00001000	/* client time-out */
-#define SN_ERR_CLICL	0x00002000	/* client closed (read/write error) */
-#define SN_ERR_SRVTO	0x00003000	/* server time-out, connect time-out */
-#define SN_ERR_SRVCL	0x00004000	/* server closed (connect/read/write error) */
-#define SN_ERR_PRXCOND	0x00005000	/* the proxy decided to close (deny...) */
-#define SN_ERR_RESOURCE	0x00006000	/* the proxy encountered a lack of a local resources (fd, mem, ...) */
-#define SN_ERR_INTERNAL	0x00007000	/* the proxy encountered an internal error */
-#define SN_ERR_DOWN	0x00008000	/* the proxy killed a session because the backend became unavailable */
-#define SN_ERR_KILLED	0x00009000	/* the proxy killed a session because it was asked to do so */
-#define SN_ERR_UP	0x0000a000	/* the proxy killed a session because a preferred backend became available */
-#define SN_ERR_MASK	0x0000f000	/* mask to get only session error flags */
-#define SN_ERR_SHIFT	12		/* bit shift */
+#define SN_ERR_NONE     0x00000000	/* normal end of request */
+#define SN_ERR_LOCAL    0x00001000	/* the proxy locally processed this request => not an error */
+#define SN_ERR_CLITO    0x00002000	/* client time-out */
+#define SN_ERR_CLICL    0x00003000	/* client closed (read/write error) */
+#define SN_ERR_SRVTO    0x00004000	/* server time-out, connect time-out */
+#define SN_ERR_SRVCL    0x00005000	/* server closed (connect/read/write error) */
+#define SN_ERR_PRXCOND  0x00006000	/* the proxy decided to close (deny...) */
+#define SN_ERR_RESOURCE 0x00007000	/* the proxy encountered a lack of a local resources (fd, mem, ...) */
+#define SN_ERR_INTERNAL 0x00008000	/* the proxy encountered an internal error */
+#define SN_ERR_DOWN     0x00009000	/* the proxy killed a session because the backend became unavailable */
+#define SN_ERR_KILLED   0x0000a000	/* the proxy killed a session because it was asked to do so */
+#define SN_ERR_UP       0x0000b000	/* the proxy killed a session because a preferred backend became available */
+#define SN_ERR_MASK     0x0000f000	/* mask to get only session error flags */
+#define SN_ERR_SHIFT    12		/* bit shift */
 
 /* session state at termination, bits values 0x10000 to 0x70000 (0-7 shift 16) */
 #define SN_FINST_R	0x00010000	/* session ended during client request */
@@ -86,19 +87,20 @@
 #define	SN_FINST_SHIFT	16		/* bit shift */
 
 #define SN_IGNORE_PRST	0x00080000	/* ignore persistence */
-#define SN_BE_TRACK_SC1 0x00100000	/* backend tracks stick-counter 1 */
-#define SN_BE_TRACK_SC2 0x00200000	/* backend tracks stick-counter 2 */
 
-#define SN_COMP_READY   0x00400000	/* the compression is initialized */
+#define SN_COMP_READY   0x00100000	/* the compression is initialized */
 
-
-/* WARNING: if new fields are added, they must be initialized in event_accept()
+/* WARNING: if new fields are added, they must be initialized in session_accept()
  * and freed in session_free() !
  */
 
-/* stick counter */
+#define STKCTR_TRACK_BACKEND 1
+#define STKCTR_TRACK_CONTENT 2
+/* stick counter. The <entry> member is a composite address (caddr) made of a
+ * pointer to an stksess struct, and two flags among STKCTR_TRACK_* above.
+ */
 struct stkctr {
-	struct stksess *entry;          /* entry containing counters currently being tracked  by this session */
+	unsigned long   entry;          /* entry containing counters currently being tracked by this session  */
 	struct stktable *table;         /* table the counters above belong to (undefined if counters are null) */
 };
 
@@ -115,7 +117,8 @@ struct stkctr {
  */
 struct session {
 	int flags;				/* some flags describing the session */
-	enum obj_type *target;			/* target to use for this session */
+	unsigned int uniq_id;			/* unique ID used for the traces */
+	enum obj_type *target;			/* target to use for this session ; for mini-sess: incoming connection */
 
 	struct channel *req;			/* request buffer */
 	struct channel *rep;			/* response buffer */
@@ -137,15 +140,16 @@ struct session {
 	struct {
 		struct stksess *ts;
 		struct stktable *table;
-		int flags;
 	} store[8];				/* tracked stickiness values to store */
 	int store_count;
+	/* 4 unused bytes here */
 
-	struct stkctr stkctr[2];                /* stick counters */
+	struct stkctr stkctr[MAX_SESS_STKCTR];  /* stick counters */
 
 	struct stream_interface si[2];          /* client and server stream interfaces */
 	struct {
 		int logwait;			/* log fields waiting to be collected : LW_* */
+		int level;			/* log level to force + 1 if > 0, -1 = no log */
 		struct timeval accept_date;	/* date of the accept() in user date */
 		struct timeval tv_accept;	/* date of the accept() in internal date (monotonic) */
 		struct timeval tv_request;	/* date the request arrives, {0,0} if never occurs */
@@ -161,7 +165,6 @@ struct session {
 	void (*do_log)(struct session *s);	/* the function to call in order to log (or NULL) */
 	void (*srv_error)(struct session *s,	/* the function to call upon unrecoverable server errors (or NULL) */
 			  struct stream_interface *si);
-	unsigned int uniq_id;			/* unique ID used for the traces */
 	struct comp_ctx *comp_ctx;		/* HTTP compression context */
 	struct comp_algo *comp_algo;		/* HTTP compression algorithm if not NULL */
 	char *unique_id;			/* custom unique ID */

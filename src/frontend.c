@@ -49,11 +49,13 @@
 /* Finish a session accept() for a proxy (TCP or HTTP). It returns a negative
  * value in case of a critical failure which must cause the listener to be
  * disabled, a positive value in case of success, or zero if it is a success
- * but the session must be closed ASAP (eg: monitoring).
+ * but the session must be closed ASAP (eg: monitoring). It only supports
+ * sessions with a connection in si[0].
  */
 int frontend_accept(struct session *s)
 {
-	int cfd = s->si[0].conn->t.sock.fd;
+	struct connection *conn = __objt_conn(s->si[0].end);
+	int cfd = conn->t.sock.fd;
 
 	tv_zero(&s->logs.tv_request);
 	s->logs.t_queue = -1;
@@ -83,8 +85,8 @@ int frontend_accept(struct session *s)
 				   (char *) &one, sizeof(one));
 
 		if (s->fe->options & PR_O_TCP_NOLING)
-			setsockopt(cfd, SOL_SOCKET, SO_LINGER,
-				   (struct linger *) &nolinger, sizeof(struct linger));
+			fdtab[cfd].linger_risk = 1;
+
 #if defined(TCP_MAXSEG)
 		if (s->listener->maxseg < 0) {
 			/* we just want to reduce the current MSS by that value */
@@ -140,16 +142,16 @@ int frontend_accept(struct session *s)
 		else {
 			char pn[INET6_ADDRSTRLEN], sn[INET6_ADDRSTRLEN];
 
-			conn_get_from_addr(s->req->prod->conn);
-			conn_get_to_addr(s->req->prod->conn);
+			conn_get_from_addr(conn);
+			conn_get_to_addr(conn);
 
-			switch (addr_to_str(&s->req->prod->conn->addr.from, pn, sizeof(pn))) {
+			switch (addr_to_str(&conn->addr.from, pn, sizeof(pn))) {
 			case AF_INET:
 			case AF_INET6:
-				addr_to_str(&s->req->prod->conn->addr.to, sn, sizeof(sn));
+				addr_to_str(&conn->addr.to, sn, sizeof(sn));
 				send_log(s->fe, LOG_INFO, "Connect from %s:%d to %s:%d (%s/%s)\n",
-					 pn, get_host_port(&s->req->prod->conn->addr.from),
-					 sn, get_host_port(&s->req->prod->conn->addr.to),
+					 pn, get_host_port(&conn->addr.from),
+					 sn, get_host_port(&conn->addr.to),
 					 s->fe->id, (s->fe->mode == PR_MODE_HTTP) ? "HTTP" : "TCP");
 				break;
 			case AF_UNIX:
@@ -165,14 +167,14 @@ int frontend_accept(struct session *s)
 	if (unlikely((global.mode & MODE_DEBUG) && (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)))) {
 		char pn[INET6_ADDRSTRLEN];
 
-		conn_get_from_addr(s->req->prod->conn);
+		conn_get_from_addr(conn);
 
-		switch (addr_to_str(&s->req->prod->conn->addr.from, pn, sizeof(pn))) {
+		switch (addr_to_str(&conn->addr.from, pn, sizeof(pn))) {
 		case AF_INET:
 		case AF_INET6:
 			chunk_printf(&trash, "%08x:%s.accept(%04x)=%04x from [%s:%d]\n",
 			             s->uniq_id, s->fe->id, (unsigned short)s->listener->fd, (unsigned short)cfd,
-			             pn, get_host_port(&s->req->prod->conn->addr.from));
+			             pn, get_host_port(&conn->addr.from));
 			break;
 		case AF_UNIX:
 			/* UNIX socket, only the destination is known */
@@ -182,7 +184,7 @@ int frontend_accept(struct session *s)
 			break;
 		}
 
-		if (write(1, trash.str, trash.len) < 0) /* shut gcc warning */;
+		shut_your_big_mouth_gcc(write(1, trash.str, trash.len));
 	}
 
 	if (s->fe->mode == PR_MODE_HTTP)
@@ -216,7 +218,7 @@ int frontend_accept(struct session *s)
 /* set temp integer to the id of the frontend */
 static int
 smp_fetch_fe_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_SESS;
 	smp->type = SMP_T_UINT;
@@ -230,7 +232,7 @@ smp_fetch_fe_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt
  */
 static int
 smp_fetch_fe_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                       const struct arg *args, struct sample *smp)
+                       const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -244,7 +246,7 @@ smp_fetch_fe_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned 
  */
 static int
 smp_fetch_fe_conn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                  const struct arg *args, struct sample *smp)
+                  const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -256,7 +258,7 @@ smp_fetch_fe_conn(struct proxy *px, struct session *l4, void *l7, unsigned int o
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct sample_fetch_kw_list smp_kws = {{ },{
+static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "fe_conn",      smp_fetch_fe_conn,      ARG1(1,FE), NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "fe_id",        smp_fetch_fe_id,        0,          NULL, SMP_T_UINT, SMP_USE_FTEND, },
 	{ "fe_sess_rate", smp_fetch_fe_sess_rate, ARG1(1,FE), NULL, SMP_T_UINT, SMP_USE_INTRN, },
@@ -267,10 +269,7 @@ static struct sample_fetch_kw_list smp_kws = {{ },{
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct acl_kw_list acl_kws = {{ },{
-	{ "fe_conn",      NULL, acl_parse_int, acl_match_int },
-	{ "fe_id",        NULL, acl_parse_int, acl_match_int },
-	{ "fe_sess_rate", NULL, acl_parse_int, acl_match_int },
+static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 

@@ -180,7 +180,7 @@ void init_server_map(struct proxy *p)
 
 	act = bck = 0;
 	for (srv = p->srv; srv; srv = srv->next) {
-		srv->eweight = srv->uweight / pgcd;
+		srv->eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
 		srv->prev_eweight = srv->eweight;
 		srv->prev_state = srv->state;
 		if (srv->state & SRV_BACKUP)
@@ -229,7 +229,7 @@ struct server *map_get_server_rr(struct proxy *px, struct server *srvtoavoid)
 	avoididx = 0; /* shut a gcc warning */
 	do {
 		srv = px->lbprm.map.srv[newidx++];
-		if (!srv->maxconn || srv->cur_sess < srv_dynamic_maxconn(srv)) {
+		if (!srv->maxconn || (!srv->nbpend && srv->served < srv_dynamic_maxconn(srv))) {
 			/* make sure it is not the server we are try to exclude... */
 			if (srv != srvtoavoid) {
 				px->lbprm.map.rr_idx = newidx;
