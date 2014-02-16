@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-Haproxy Dev 1.5.18
-=======
                          ----------------------
                              HAProxy how-to
                          ----------------------
@@ -505,6 +502,3 @@ If you decide to use Git for your developments, then your commit messages will
 have the subject line in the format described above, then the whole description
 of your work (mainly why you did it) will be in the body. You can directly send
 your commits to the mailing list, the format is convenient to read and process.
-
--- end
->>>>>>> 1a34d57d26b5b4436d38e59506ed012ecfe0b815
